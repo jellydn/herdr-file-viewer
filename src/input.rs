@@ -387,6 +387,13 @@ pub(crate) const REGISTRY: &[Binding] = &[
         description: "Close the viewer and return to the prior pane.",
         category: "Session",
     },
+    Binding {
+        intent: Intent::DirectoryDiff,
+        name: "directory_diff",
+        default_keys: &[KeyCode::Char('d')],
+        description: "Toggle directory-level diff view showing all changes in the current directory.",
+        category: "Git & filters",
+    },
 ];
 
 /// Borrow the [keybinding registry](REGISTRY) rows: the single source of truth for each global
@@ -716,6 +723,7 @@ mod tests {
         (KeyCode::Char('?'), Intent::ShowHelp),
         (KeyCode::Char('q'), Intent::Close),
         (KeyCode::Esc, Intent::Close),
+        (KeyCode::Char('d'), Intent::DirectoryDiff),
     ];
 
     #[test]
@@ -1143,6 +1151,27 @@ mod tests {
         // Lowercase `o` stays unbound; `r` stays Refresh (no collision).
         assert_eq!(map_key(k(KeyCode::Char('o'))), None);
         assert_eq!(map_key(k(KeyCode::Char('r'))), Some(Intent::Refresh));
+    }
+
+    #[test]
+    fn d_maps_to_directory_diff_and_ctrl_chord_is_inert() {
+        // `d` toggles directory-level diff view (AC-1). Ctrl-d / Alt-d must not fire an intent.
+        assert_eq!(map_key(k(KeyCode::Char('d'))), Some(Intent::DirectoryDiff));
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::SHIFT)),
+            Some(Intent::DirectoryDiff),
+            "D with SHIFT bit set still maps to DirectoryDiff"
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            None,
+            "Ctrl-d must not fire an intent"
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT)),
+            None,
+            "Alt-d must not fire an intent"
+        );
     }
 
     #[test]

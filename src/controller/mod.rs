@@ -446,6 +446,10 @@ pub struct Controller {
     /// is the pre-confirm behavior.
     confirm_discard: bool,
     changed_only: bool,
+    /// Whether directory-level diff mode is active (showing all changes in a directory).
+    directory_diff_active: bool,
+    /// The directory path for directory-level diff mode, if active.
+    directory_diff_path: Option<PathBuf>,
     /// The tree's horizontal scroll offset (columns), for reading long / deeply-nested rows. Like
     /// the cursor it is navigation state: reset on a re-root (AC-13), not carried.
     tree_hscroll: u16,
@@ -726,6 +730,8 @@ impl Controller {
             confirm_discard: true,
             tree_hscroll: 0,
             changed_only: false,
+            directory_diff_active: false,
+            directory_diff_path: None,
             focus: Focus::Tree,
             width: 0,
             content_scroll: 0,
@@ -1600,6 +1606,7 @@ impl Controller {
             },
             Intent::ShowHelp => self.open_help(),
             Intent::Close => self.close_or_unzoom(),
+            Intent::DirectoryDiff => self.toggle_directory_diff(),
         }
     }
 
@@ -1891,6 +1898,43 @@ impl Controller {
         self.tree.set_changed_only(self.changed_only, &self.changed);
         self.dispatch_render();
         Effects::redraw()
+    }
+
+    fn toggle_directory_diff(&mut self) -> Effects {
+        if !self.is_git_repo {
+            return Effects::noop(); // inert without git (AC-26)
+        }
+        let Some(node) = self.tree.selected() else {
+            return Effects::noop();
+        };
+        // Get the parent directory of the selected file
+        let dir = node.path.parent().unwrap_or(&node.path);
+        // Toggle: if already in DirectoryDiff for this dir, go back to the file's view
+        if self.directory_diff_active {
+            self.directory_diff_active = false;
+            self.directory_diff_path = None;
+            self.dispatch_render();
+            Effects::redraw()
+        } else {
+            // Compute the directory diff synchronously
+            let diff = crate::git::diff_directory(
+                &self.root,
+                dir,
+                self.baseline,
+                self.current_branch.as_deref(),
+            );
+            // Store the result directly in the content buffer
+            self.content = Text::raw(diff);
+            self.content_notices.clear();
+            self.content_source = None;
+            self.content_path = Some(dir.to_path_buf());
+            self.content_rendering = false;
+            // Enter directory diff mode
+            self.directory_diff_active = true;
+            self.directory_diff_path = Some(dir.to_path_buf());
+            // Don't call dispatch_render() - content is already set
+            Effects::redraw()
+        }
     }
 
     fn toggle_baseline(&mut self) -> Effects {

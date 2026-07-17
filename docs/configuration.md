@@ -90,8 +90,8 @@ either to view bigger files (`preview_max_lines` up to `100000`, `preview_max_ki
 64 MB); both clamp into range, and a very large value can make the pane slower to render.
 
 One caveat for **diffs**: a diff is additionally bounded at ~4 MB by the git-capture step, independent
-of `preview_max_kib`. So raising `preview_max_kib` above ~4 MB widens how much *file content* is shown
-but not how much of a very large *diff* is (a diff past that bound is shown up to ~4 MB).
+of `preview_max_kib`. So raising `preview_max_kib` above ~4 MB widens how much _file content_ is shown
+but not how much of a very large _diff_ is (a diff past that bound is shown up to ~4 MB).
 
 `confirm_discard` guards the one piece of state the viewer can lose. Annotations (`a` / `A`) are
 session-only, so both quitting (`q`) and switching worktree (`W`) discard them. By default either
@@ -137,43 +137,44 @@ These are all the actions you can put in `[keys]`, keyed by intent name, with th
 The `?` help overlay's **Keybindings** section shows the same list live (and marks the ones you have
 customized).
 
-| Group | Intent name (`[keys]` id) | Default key(s) | Action |
-| --- | --- | --- | --- |
-| **Navigation** | `nav_up` | `Up`, `k` | Move the tree cursor up one row |
-| | `nav_down` | `Down`, `j` | Move the tree cursor down one row |
-| | `expand` | `Right`, `l` | Expand the selected directory |
-| | `collapse` | `Left`, `h` | Collapse the selected directory |
-| | `activate` | `Enter` | Activate the selection: expand/collapse a directory, or open a file |
-| **View & layout** | `open_fullscreen` | `Z` | Toggle full-screen reading of the selected file |
-| | `cycle_view` | `v` | Cycle the content pane's view mode |
-| | `toggle_focus` | `Tab` | Move focus between the tree and content columns |
-| | `shrink_tree` | `<` | Narrow the tree column |
-| | `grow_tree` | `>` | Widen the tree column |
-| | `toggle_wrap` | `w` | Force content-line wrapping on or off |
-| | `toggle_zoom` | `z` | Hide the tree so content fills the frame, or restore the split |
-| | `tree_scroll_left` | `H` | Scroll the tree pane left |
-| | `tree_scroll_right` | `L` | Scroll the tree pane right |
-| **Git & filters** | `toggle_ignore` | `i` | Reveal or hide gitignored files |
-| | `toggle_hidden` | `.` | Hide or reveal dot-prefixed (hidden) files and folders |
-| | `toggle_changed_only` | `c` | Restrict the tree to changed files, or restore the full tree |
-| | `toggle_baseline` | `b` | Switch the diff baseline between base-branch and `HEAD` |
-| | `refresh` | `r` | Re-read git state and re-render |
-| **Open & copy** | `open_in_editor` | `e` | Hand the selected file off to an external editor |
-| | `open_with_app` | `O` | Open the selected entry with the OS default application |
-| | `reveal_in_file_manager` | `R` | Reveal the selected entry in the OS file manager |
-| | `copy_repo_path` | `y` | Copy the selected node's repo-relative path to the clipboard |
-| | `copy_abs_path` | `Y` | Copy the selected node's absolute path to the clipboard |
-| **Annotations** | `add_annotation` | `a` | Add an in-memory annotation for the selected file |
-| | `show_annotations` | `A` | Open the session annotation overview |
-| **Search & jump** | `open_finder` | `f` | Open the go-to-file fuzzy finder |
-| | `open_go_to_line` | `:` | Open the go-to-line prompt |
-| | `open_search` | `/` | Open the in-file search prompt |
-| | `next_match` | `n` | Jump to the next search match (wraps) |
-| | `prev_match` | `N` | Jump to the previous search match (wraps) |
-| **Session** | `dismiss_update` | `u` | Dismiss the update-available banner for this session |
-| | `switch_worktree` | `W` | Open the worktree picker to re-root at another git worktree |
-| | `show_help` | `?` | Open the in-app help overlay (What's New and About) |
-| | `close` | `q`, `Esc` | Close the viewer and return to the prior pane |
+| Group             | Intent name (`[keys]` id) | Default key(s) | Action                                                              |
+| ----------------- | ------------------------- | -------------- | ------------------------------------------------------------------- |
+| **Navigation**    | `nav_up`                  | `Up`, `k`      | Move the tree cursor up one row                                     |
+|                   | `nav_down`                | `Down`, `j`    | Move the tree cursor down one row                                   |
+|                   | `expand`                  | `Right`, `l`   | Expand the selected directory                                       |
+|                   | `collapse`                | `Left`, `h`    | Collapse the selected directory                                     |
+|                   | `activate`                | `Enter`        | Activate the selection: expand/collapse a directory, or open a file |
+| **View & layout** | `open_fullscreen`         | `Z`            | Toggle full-screen reading of the selected file                     |
+|                   | `cycle_view`              | `v`            | Cycle the content pane's view mode                                  |
+|                   | `toggle_focus`            | `Tab`          | Move focus between the tree and content columns                     |
+|                   | `shrink_tree`             | `<`            | Narrow the tree column                                              |
+|                   | `grow_tree`               | `>`            | Widen the tree column                                               |
+|                   | `toggle_wrap`             | `w`            | Force content-line wrapping on or off                               |
+|                   | `toggle_zoom`             | `z`            | Hide the tree so content fills the frame, or restore the split      |
+|                   | `tree_scroll_left`        | `H`            | Scroll the tree pane left                                           |
+|                   | `tree_scroll_right`       | `L`            | Scroll the tree pane right                                          |
+| **Git & filters** | `toggle_ignore`           | `i`            | Reveal or hide gitignored files                                     |
+|                   | `toggle_hidden`           | `.`            | Hide or reveal dot-prefixed (hidden) files and folders              |
+|                   | `toggle_changed_only`     | `c`            | Restrict the tree to changed files, or restore the full tree        |
+|                   | `toggle_baseline`         | `b`            | Switch the diff baseline between base-branch and `HEAD`             |
+|                   | `directory_diff`          | `d`            | Show all changes in the current directory as a unified diff         |
+|                   | `refresh`                 | `r`            | Re-read git state and re-render                                     |
+| **Open & copy**   | `open_in_editor`          | `e`            | Hand the selected file off to an external editor                    |
+|                   | `open_with_app`           | `O`            | Open the selected entry with the OS default application             |
+|                   | `reveal_in_file_manager`  | `R`            | Reveal the selected entry in the OS file manager                    |
+|                   | `copy_repo_path`          | `y`            | Copy the selected node's repo-relative path to the clipboard        |
+|                   | `copy_abs_path`           | `Y`            | Copy the selected node's absolute path to the clipboard             |
+| **Annotations**   | `add_annotation`          | `a`            | Add an in-memory annotation for the selected file                   |
+|                   | `show_annotations`        | `A`            | Open the session annotation overview                                |
+| **Search & jump** | `open_finder`             | `f`            | Open the go-to-file fuzzy finder                                    |
+|                   | `open_go_to_line`         | `:`            | Open the go-to-line prompt                                          |
+|                   | `open_search`             | `/`            | Open the in-file search prompt                                      |
+|                   | `next_match`              | `n`            | Jump to the next search match (wraps)                               |
+|                   | `prev_match`              | `N`            | Jump to the previous search match (wraps)                           |
+| **Session**       | `dismiss_update`          | `u`            | Dismiss the update-available banner for this session                |
+|                   | `switch_worktree`         | `W`            | Open the worktree picker to re-root at another git worktree         |
+|                   | `show_help`               | `?`            | Open the in-app help overlay (What's New and About)                 |
+|                   | `close`                   | `q`, `Esc`     | Close the viewer and return to the prior pane                       |
 
 `Esc` always closes the viewer even if you rebind `close` — that floor can't be rebound away (see
 below). Keys handled inside a modal are fixed and not remappable. That includes line-select `a`

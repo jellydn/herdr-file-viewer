@@ -243,7 +243,9 @@ pub fn render(
             renderers.timeout,
             base_notice,
         ),
-        ViewMode::Diff | ViewMode::FullDiff => unreachable!("handled above"),
+        ViewMode::Diff | ViewMode::FullDiff => {
+            unreachable!("handled above")
+        }
     }
 }
 

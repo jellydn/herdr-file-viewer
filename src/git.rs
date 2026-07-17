@@ -209,6 +209,31 @@ pub fn changed_set(
     }
 }
 
+/// Raw unified diff text for a directory against `baseline`. Shows all changes in the
+/// directory as a unified diff. Empty if unavailable.
+pub fn diff_directory(
+    repo_root: &Path,
+    dir: &Path,
+    baseline: Baseline,
+    base_hint: Option<&str>,
+) -> String {
+    if !is_within_root(repo_root, dir) {
+        return String::new();
+    }
+    let against = match baseline {
+        Baseline::Head => head_or_empty_tree(repo_root),
+        Baseline::Base => {
+            base_fork_point(repo_root, base_hint).unwrap_or_else(|| head_or_empty_tree(repo_root))
+        }
+    };
+    let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "--no-color"];
+    args.push(&against);
+    args.push("--");
+    let mut cmd = git_command(repo_root, &args);
+    cmd.arg(dir);
+    capture_stdout(cmd)
+}
+
 /// Raw unified diff text for one file against `baseline` (AC-9). Empty if unavailable.
 /// An untracked file (or any file in an unborn repo) is diffed against the empty tree so
 /// AC-9 still shows the new file's content rather than an empty pane.

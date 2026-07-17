@@ -129,12 +129,16 @@ pub enum Intent {
     TreeScrollRight,
     /// Close the viewer and return control to the prior pane (AC-20).
     Close,
+    /// Toggle directory-level diff view: show all changes in the current directory as a
+    /// unified diff. Read-only — it only changes the view mode; no file or git mutation
+    /// (AC-1, AC-N1, AC-N3).
+    DirectoryDiff,
 }
 
 impl Intent {
     /// Every intent variant — lets the dispatcher and tests enumerate the closed set so
     /// keyboard-completeness (AC-18) and the no-file/git-mutation invariant (AC-N3) stay checkable.
-    pub const ALL: [Intent; 35] = [
+    pub const ALL: [Intent; 36] = [
         Intent::NavUp,
         Intent::NavDown,
         Intent::Expand,
@@ -170,6 +174,7 @@ impl Intent {
         Intent::TreeScrollRight,
         Intent::ShowHelp,
         Intent::Close,
+        Intent::DirectoryDiff,
     ];
 }
 
@@ -219,7 +224,8 @@ mod tests {
                 | Intent::TreeScrollLeft
                 | Intent::TreeScrollRight
                 | Intent::ShowHelp
-                | Intent::Close => (false, false),
+                | Intent::Close
+                | Intent::DirectoryDiff => (false, false),
             };
             assert!(
                 !mutates_file_or_git,
@@ -292,11 +298,11 @@ mod tests {
     }
 
     #[test]
-    fn all_length_is_35() {
+    fn all_length_is_36() {
         assert_eq!(
             Intent::ALL.len(),
-            35,
-            "Intent::ALL must have exactly 35 variants after adding annotation actions"
+            36,
+            "Intent::ALL must have exactly 36 variants after adding DirectoryDiff"
         );
     }
 
