@@ -106,6 +106,50 @@ impl GitService for RecordingGit {
     }
 }
 
+/// A Git stub that records every `diff_directory` pathspec and returns a canned body, so a
+/// test can prove the `d` directory-diff path hits the injected seam (not a free-function
+/// `git` call) and scopes to the selected directory / parent of a file.
+struct DirDiffGit {
+    calls: Arc<Mutex<Vec<PathBuf>>>,
+    body: String,
+}
+impl GitService for DirDiffGit {
+    fn status(&self) -> BTreeMap<PathBuf, Status> {
+        BTreeMap::new()
+    }
+    fn changed_set(&self, _: Baseline) -> BTreeMap<PathBuf, Status> {
+        BTreeMap::new()
+    }
+    fn diff(&self, _: &Path, _: Baseline, _full: bool) -> String {
+        String::new()
+    }
+    fn diff_directory(&self, rel_dir: &Path, _baseline: Baseline) -> String {
+        self.calls.lock().unwrap().push(rel_dir.to_path_buf());
+        self.body.clone()
+    }
+}
+
+/// A ContentProvider that surfaces the raw_diff (when present) so tests can assert the
+/// directory-diff job reached the delta render path rather than a plain Text::raw write.
+struct DiffAwareContent;
+impl ContentProvider for DiffAwareContent {
+    fn render(&self, path: &Path, mode: ViewMode, raw_diff: Option<&str>) -> RenderResult {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let body = match raw_diff {
+            Some(d) => format!("mode={mode:?};diff={d}"),
+            None => format!("mode={mode:?};file={name}"),
+        };
+        RenderResult {
+            content: Text::raw(body),
+            notices: Vec::new(),
+            source: None,
+        }
+    }
+}
+
 /// Flatten a content `Text` to a plain string for assertions.
 fn flatten(text: &Text) -> String {
     text.lines
@@ -956,4 +1000,249 @@ fn a_committed_search_ordinal_is_clamped_when_a_reflow_shrinks_the_match_count()
     );
     // And navigation on the clamped state does not panic.
     ctrl.handle(Intent::NextMatch);
+}
+
+// ── Directory-diff (`d`) ───────────────────────────────────────────────────────────────
+
+/// Spin `poll()` until the content pane contains `marker` (or the deadline trips).
+fn await_content(ctrl: &mut Controller, marker: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        ctrl.poll();
+        if flatten(ctrl.content()).contains(marker) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "content never contained {marker:?}; last={:?}",
+            flatten(ctrl.content())
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn dir_diff_controller(root: &Path, git: Arc<dyn GitService>) -> Controller {
+    let components = Components {
+        providers: Box::new(move |_resolved| RootProviders {
+            git: Arc::clone(&git),
+            content: Box::new(DiffAwareContent),
+        }),
+        editor: Box::new(NoEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    Controller::new(
+        common::resolved(root.to_path_buf(), true),
+        Baseline::Head,
+        components,
+    )
+}
+
+#[test]
+fn directory_diff_on_a_file_scopes_to_its_parent_and_uses_delta_path() {
+    // `d` on a file under `src/` diffs the parent directory (not the file alone) and feeds
+    // the raw unified diff through the ContentProvider as ViewMode::Diff (delta path).
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(dir.path().join("src/b.rs"), "fn b() {}\n").unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let git: Arc<dyn GitService> = Arc::new(DirDiffGit {
+        calls: calls.clone(),
+        body: "dir-diff-body".into(),
+    });
+    let mut ctrl = dir_diff_controller(dir.path(), git);
+
+    // Select the first file under src/ (tree order: dirs first, then files).
+    // Expand src, then move onto a.rs.
+    while ctrl
+        .tree()
+        .selected()
+        .map(|n| n.path.file_name().map(|s| s == "a.rs").unwrap_or(false))
+        != Some(true)
+    {
+        // Expand directories as we pass them so their children become visible.
+        if ctrl
+            .tree()
+            .selected()
+            .map(|n| n.kind == herdr_file_viewer::tree::NodeKind::Dir && !n.expanded)
+            .unwrap_or(false)
+        {
+            ctrl.handle(Intent::Expand);
+        }
+        ctrl.handle(Intent::NavDown);
+    }
+
+    let fx = ctrl.handle(Intent::DirectoryDiff);
+    assert!(fx.redraw, "entering directory-diff redraws");
+    await_content(&mut ctrl, "dir-diff-body");
+    assert!(
+        flatten(ctrl.content()).contains("mode=Diff"),
+        "directory-diff must render as ViewMode::Diff (delta), got {:?}",
+        flatten(ctrl.content())
+    );
+
+    let recorded = calls.lock().unwrap().clone();
+    assert!(
+        recorded.iter().any(|p| p == Path::new("src")),
+        "diff_directory must be called with the parent dir `src`, got {recorded:?}"
+    );
+}
+
+#[test]
+fn directory_diff_on_a_directory_scopes_to_that_directory() {
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("pkg")).unwrap();
+    std::fs::write(dir.path().join("pkg/x.rs"), "x\n").unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let git: Arc<dyn GitService> = Arc::new(DirDiffGit {
+        calls: calls.clone(),
+        body: "pkg-diff".into(),
+    });
+    let mut ctrl = dir_diff_controller(dir.path(), git);
+
+    // Move onto the `pkg` directory node.
+    while ctrl
+        .tree()
+        .selected()
+        .map(|n| n.path.file_name().map(|s| s == "pkg").unwrap_or(false))
+        != Some(true)
+    {
+        ctrl.handle(Intent::NavDown);
+    }
+
+    ctrl.handle(Intent::DirectoryDiff);
+    await_content(&mut ctrl, "pkg-diff");
+    let recorded = calls.lock().unwrap().clone();
+    assert!(
+        recorded.iter().any(|p| p == Path::new("pkg")),
+        "diff_directory must scope to the selected directory `pkg`, got {recorded:?}"
+    );
+}
+
+#[test]
+fn directory_diff_toggles_off_and_returns_to_normal_view() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "1\n").unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let git: Arc<dyn GitService> = Arc::new(DirDiffGit {
+        calls: calls.clone(),
+        body: "root-diff".into(),
+    });
+    let mut ctrl = dir_diff_controller(dir.path(), git);
+
+    // On a root-level file, current directory is the tree root (empty pathspec).
+    ctrl.handle(Intent::DirectoryDiff);
+    await_content(&mut ctrl, "root-diff");
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_os_str().is_empty()),
+        "root-level directory-diff uses empty pathspec"
+    );
+
+    // Toggle off → normal file view (no raw_diff).
+    ctrl.handle(Intent::DirectoryDiff);
+    await_content(&mut ctrl, "file=a.rs");
+    assert!(
+        flatten(ctrl.content()).contains("file=a.rs"),
+        "toggling off returns to the normal file view, got {:?}",
+        flatten(ctrl.content())
+    );
+}
+
+#[test]
+fn directory_diff_leaves_when_selection_moves_to_another_directory() {
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("one")).unwrap();
+    std::fs::create_dir_all(dir.path().join("two")).unwrap();
+    std::fs::write(dir.path().join("one/a.rs"), "a\n").unwrap();
+    std::fs::write(dir.path().join("two/b.rs"), "b\n").unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let git: Arc<dyn GitService> = Arc::new(DirDiffGit {
+        calls: calls.clone(),
+        body: "one-diff".into(),
+    });
+    let mut ctrl = dir_diff_controller(dir.path(), git);
+
+    // Expand `one`, select a.rs, enter directory-diff for `one`.
+    while ctrl
+        .tree()
+        .selected()
+        .map(|n| n.path.file_name().map(|s| s == "a.rs").unwrap_or(false))
+        != Some(true)
+    {
+        if ctrl
+            .tree()
+            .selected()
+            .map(|n| n.kind == herdr_file_viewer::tree::NodeKind::Dir && !n.expanded)
+            .unwrap_or(false)
+        {
+            ctrl.handle(Intent::Expand);
+        }
+        ctrl.handle(Intent::NavDown);
+    }
+    ctrl.handle(Intent::DirectoryDiff);
+    await_content(&mut ctrl, "one-diff");
+    let calls_before = calls.lock().unwrap().len();
+
+    // Move onto `two` (a different directory) — sticky mode must drop so the next `d`
+    // can open the new directory instead of toggling off.
+    while ctrl
+        .tree()
+        .selected()
+        .map(|n| n.path.file_name().map(|s| s == "two").unwrap_or(false))
+        != Some(true)
+    {
+        ctrl.handle(Intent::NavDown);
+    }
+    // Directory selected → empty-state guidance (mode left).
+    assert!(
+        !flatten(ctrl.content()).contains("one-diff"),
+        "leaving the directory must drop the sticky directory-diff view"
+    );
+
+    // Entering directory-diff again must target `two`, not toggle off.
+    ctrl.handle(Intent::DirectoryDiff);
+    await_content(&mut ctrl, "one-diff"); // body is canned; path is what we care about
+    let recorded = calls.lock().unwrap().clone();
+    assert!(
+        recorded.len() > calls_before,
+        "a fresh directory-diff call must be made after leaving the old directory"
+    );
+    assert!(
+        recorded.iter().any(|p| p == Path::new("two")),
+        "after moving, `d` must open the new directory `two`, got {recorded:?}"
+    );
+}
+
+#[test]
+fn directory_diff_is_inert_without_git() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "1\n").unwrap();
+    let components = Components {
+        providers: Box::new(move |_resolved| RootProviders {
+            git: Arc::new(NoGit),
+            content: Box::new(DiffAwareContent),
+        }),
+        editor: Box::new(NoEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), false), // not a git repo
+        Baseline::Head,
+        components,
+    );
+    await_content(&mut ctrl, "file=a.rs");
+    let before = flatten(ctrl.content());
+    let fx = ctrl.handle(Intent::DirectoryDiff);
+    assert!(!fx.redraw, "directory-diff is inert without git (AC-26)");
+    assert_eq!(
+        flatten(ctrl.content()),
+        before,
+        "content must not change when directory-diff is inert"
+    );
 }
