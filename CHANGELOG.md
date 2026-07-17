@@ -5,6 +5,11 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Entries are short on purpose; follow the
 `→` links for the full detail.
 
+## [Unreleased]
+
+### Added
+- Directory-level git diff (`d`): show all changes under the selected directory (or the parent of a selected file) as a unified diff in the content pane, rendered through delta like a file diff; press `d` again to return to the normal view. → [usage](docs/usage.md#git-awareness) · [keys](docs/keys.md)
+
 ## [1.13.0] - 2026-07-16
 
 ### Added

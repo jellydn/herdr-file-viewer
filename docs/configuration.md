@@ -157,7 +157,7 @@ customized).
 |                   | `toggle_hidden`           | `.`            | Hide or reveal dot-prefixed (hidden) files and folders              |
 |                   | `toggle_changed_only`     | `c`            | Restrict the tree to changed files, or restore the full tree        |
 |                   | `toggle_baseline`         | `b`            | Switch the diff baseline between base-branch and `HEAD`             |
-|                   | `directory_diff`          | `d`            | Show all changes in the current directory as a unified diff         |
+|                   | `directory_diff`          | `d`            | Toggle a unified diff of all changes under the selected directory   |
 |                   | `refresh`                 | `r`            | Re-read git state and re-render                                     |
 | **Open & copy**   | `open_in_editor`          | `e`            | Hand the selected file off to an external editor                    |
 |                   | `open_with_app`           | `O`            | Open the selected entry with the OS default application             |

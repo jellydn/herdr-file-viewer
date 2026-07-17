@@ -74,6 +74,10 @@ Git status is woven straight into the tree, not a separate mode:
 - **Changed-files-only filter**: press `c` to restrict the tree to files git reports as changed.
 - **Diff baseline**: press `b` to flip what "changed" and the diff compare against — the merge-base
   of your branch (review your whole branch) versus `HEAD` (just your uncommitted work).
+- **Directory diff**: press `d` to show every change under the selected directory (or the parent of
+  the selected file) as one unified diff in the content pane — useful for scanning a whole folder
+  before diving into individual files. Press `d` again to return to the normal file view; moving
+  into a different directory also leaves the mode. Rendered through `delta` like a file diff.
 - **Refresh**: the viewer re-reads git status automatically when the pane regains focus, so a merge,
   pull, or commit you make elsewhere shows up on its own; `r` forces a full refresh on demand.
 
