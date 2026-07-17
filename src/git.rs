@@ -209,15 +209,18 @@ pub fn changed_set(
     }
 }
 
-/// Raw unified diff text for a directory against `baseline`. Shows all changes in the
-/// directory as a unified diff. Empty if unavailable.
+/// Raw unified diff text for a directory against `baseline`. Shows all changes under the
+/// directory as a unified diff (the `d` directory-diff view). `dir` is repo-root-relative;
+/// empty means the whole worktree. Empty string if unavailable / out of root.
 pub fn diff_directory(
     repo_root: &Path,
     dir: &Path,
     baseline: Baseline,
     base_hint: Option<&str>,
 ) -> String {
-    if !is_within_root(repo_root, dir) {
+    // Empty path = the whole worktree root (directory-diff at the tree root). Non-empty
+    // paths must stay inside the root (AC-N5), matching `diff`.
+    if !dir.as_os_str().is_empty() && !is_within_root(repo_root, dir) {
         return String::new();
     }
     let against = match baseline {
@@ -230,7 +233,10 @@ pub fn diff_directory(
     args.push(&against);
     args.push("--");
     let mut cmd = git_command(repo_root, &args);
-    cmd.arg(dir);
+    // An empty path scopes to the whole worktree; otherwise pass the directory as a pathspec.
+    if !dir.as_os_str().is_empty() {
+        cmd.arg(dir);
+    }
     capture_stdout(cmd)
 }
 

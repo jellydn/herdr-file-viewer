@@ -391,7 +391,7 @@ pub(crate) const REGISTRY: &[Binding] = &[
         intent: Intent::DirectoryDiff,
         name: "directory_diff",
         default_keys: &[KeyCode::Char('d')],
-        description: "Toggle directory-level diff view showing all changes in the current directory.",
+        description: "Toggle a unified diff of all changes under the selected directory (or the parent of a file).",
         category: "Git & filters",
     },
 ];

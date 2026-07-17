@@ -104,6 +104,12 @@ pub trait GitService: Send + Sync {
     /// `full_context`, git emits the whole file as context (for the full-file diff view);
     /// otherwise it returns the compact hunks-only diff.
     fn diff(&self, rel_path: &Path, baseline: Baseline, full_context: bool) -> String;
+    /// Raw unified diff text for every change under a repo-root-relative directory against
+    /// `baseline` (directory-diff view, `d`). Default empty so hermetic stubs need not care;
+    /// the live service overrides it.
+    fn diff_directory(&self, _rel_dir: &Path, _baseline: Baseline) -> String {
+        String::new()
+    }
 }
 
 /// The rendered content pane for one file: ingested text plus any non-fatal notices
@@ -267,10 +273,15 @@ struct RenderJob {
     seq: u64,
     path: PathBuf,
     /// Repo-root-relative path for the git diff query (`None` if outside the root).
+    /// For a directory-diff job this is the directory (empty = repo root).
     rel: Option<PathBuf>,
     mode: ViewMode,
     baseline: Baseline,
     is_git: bool,
+    /// When true, the worker fetches a directory-scoped unified diff via
+    /// [`GitService::diff_directory`] and renders it as [`ViewMode::Diff`] (delta), ignoring
+    /// the file-level mode selection.
+    directory_diff: bool,
     /// The content pane's drawable text width (columns) at dispatch, or `None` when unknown
     /// (e.g. the very first render before the first draw measured the pane). Only the markdown
     /// delegate uses it: glow lays out and wraps tables to this width so they fit the pane
@@ -446,9 +457,9 @@ pub struct Controller {
     /// is the pre-confirm behavior.
     confirm_discard: bool,
     changed_only: bool,
-    /// Whether directory-level diff mode is active (showing all changes in a directory).
-    directory_diff_active: bool,
-    /// The directory path for directory-level diff mode, if active.
+    /// Absolute path of the directory currently shown as a directory-level unified diff (`d`).
+    /// `None` means the content pane follows the normal file/view-mode path. Cleared on toggle-off,
+    /// selection change, re-root — any `dispatch_render` that is not re-entering directory mode.
     directory_diff_path: Option<PathBuf>,
     /// The tree's horizontal scroll offset (columns), for reading long / deeply-nested rows. Like
     /// the cursor it is navigation state: reset on a re-root (AC-13), not carried.
@@ -730,7 +741,6 @@ impl Controller {
             confirm_discard: true,
             tree_hscroll: 0,
             changed_only: false,
-            directory_diff_active: false,
             directory_diff_path: None,
             focus: Focus::Tree,
             width: 0,
@@ -821,21 +831,27 @@ impl Controller {
                 // ever reach `poll`, and `content_rendering` would never clear — stranding the
                 // pane on the `Rendering…` placeholder for the rest of the session.
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    let raw_diff =
-                        if matches!(job.mode, ViewMode::Diff | ViewMode::FullDiff) && job.is_git {
-                            let full = job.mode == ViewMode::FullDiff;
-                            job.rel
-                                .as_deref()
-                                .map(|rel| git.diff(rel, job.baseline, full))
-                        } else {
-                            None
-                        };
-                    content.render_at_width(
-                        &job.path,
-                        job.mode,
-                        raw_diff.as_deref(),
-                        job.wrap_width,
-                    )
+                    // Directory-diff jobs always want the compact unified diff for a path
+                    // prefix; file jobs only fetch a diff when the view mode needs one.
+                    let (mode, raw_diff) = if job.directory_diff && job.is_git {
+                        let raw = job
+                            .rel
+                            .as_deref()
+                            .map(|rel| git.diff_directory(rel, job.baseline))
+                            .unwrap_or_default();
+                        (ViewMode::Diff, Some(raw))
+                    } else if matches!(job.mode, ViewMode::Diff | ViewMode::FullDiff) && job.is_git
+                    {
+                        let full = job.mode == ViewMode::FullDiff;
+                        let raw = job
+                            .rel
+                            .as_deref()
+                            .map(|rel| git.diff(rel, job.baseline, full));
+                        (job.mode, raw)
+                    } else {
+                        (job.mode, None)
+                    };
+                    content.render_at_width(&job.path, mode, raw_diff.as_deref(), job.wrap_width)
                 }))
                 .unwrap_or_else(|_| RenderResult {
                     content: Text::raw("[content unavailable: renderer error]"),
@@ -949,6 +965,8 @@ impl Controller {
         // path so the title falls back to a neutral label until the new selection's render lands
         //. `dispatch_render` below sets `content_rendering` and the loading placeholder.
         self.content_path = None;
+        // Directory-diff was scoped to a path under the old root; drop it with the re-root.
+        self.directory_diff_path = None;
         let cleared_annotations = self.annotations.clear();
         self.action_notice = (cleared_annotations > 0).then(|| {
             format!(
@@ -1904,37 +1922,34 @@ impl Controller {
         if !self.is_git_repo {
             return Effects::noop(); // inert without git (AC-26)
         }
-        let Some(node) = self.tree.selected() else {
+        let Some(dir) = self.current_directory() else {
             return Effects::noop();
         };
-        // Get the parent directory of the selected file
-        let dir = node.path.parent().unwrap_or(&node.path);
-        // Toggle: if already in DirectoryDiff for this dir, go back to the file's view
-        if self.directory_diff_active {
-            self.directory_diff_active = false;
+        // Toggle off only when already showing this same directory; otherwise enter/switch.
+        if self.directory_diff_path.as_ref() == Some(&dir) {
             self.directory_diff_path = None;
             self.dispatch_render();
-            Effects::redraw()
-        } else {
-            // Compute the directory diff synchronously
-            let diff = crate::git::diff_directory(
-                &self.root,
-                dir,
-                self.baseline,
-                self.current_branch.as_deref(),
-            );
-            // Store the result directly in the content buffer
-            self.content = Text::raw(diff);
-            self.content_notices.clear();
-            self.content_source = None;
-            self.content_path = Some(dir.to_path_buf());
-            self.content_rendering = false;
-            // Enter directory diff mode
-            self.directory_diff_active = true;
-            self.directory_diff_path = Some(dir.to_path_buf());
-            // Don't call dispatch_render() - content is already set
-            Effects::redraw()
+            return Effects::redraw();
         }
+        // Enter (or re-target) directory-diff mode and render off-thread via the same
+        // worker path as file diffs (delta + AC-23 / AC-27).
+        self.directory_diff_path = Some(dir);
+        self.dispatch_render();
+        Effects::redraw()
+    }
+
+    /// Absolute path of the "current directory" for directory-diff: the selected directory
+    /// itself, or the parent of a selected file (the tree root when the file is at root).
+    fn current_directory(&self) -> Option<PathBuf> {
+        let node = self.tree.selected()?;
+        Some(match node.kind {
+            NodeKind::Dir => node.path.clone(),
+            NodeKind::File => node
+                .path
+                .parent()
+                .unwrap_or(self.root.as_path())
+                .to_path_buf(),
+        })
     }
 
     fn toggle_baseline(&mut self) -> Effects {
@@ -1964,6 +1979,8 @@ impl Controller {
         if node.kind != NodeKind::File {
             return Effects::noop();
         }
+        // Leaving directory-diff so `v` can cycle the selected file's normal modes.
+        self.directory_diff_path = None;
         let modes = applicable_modes(&self.descriptor(&node.path));
         let current = self.effective_mode(&node.path);
         let idx = modes.iter().position(|m| *m == current).unwrap_or(0);
@@ -2497,6 +2514,7 @@ impl Controller {
             mode: ViewMode::RenderedMarkdown,
             baseline: self.baseline,
             is_git: self.is_git_repo,
+            directory_diff: false,
             wrap_width: self.md_wrap_width(),
         });
     }
@@ -2504,8 +2522,15 @@ impl Controller {
     /// Dispatch a render of the current selection to the worker thread (AC-23) — never
     /// blocking and doing **no git or rendering work on the input thread**: the worker reads
     /// the diff and delegates to the external renderer. A directory or empty selection clears
-    /// the pane synchronously (no job). Every call bumps `latest_seq`, so any still-in-flight
-    /// render for the previous selection is superseded and dropped by [`poll`].
+    /// the pane synchronously (no job) unless directory-diff mode is active. Every call bumps
+    /// `latest_seq`, so any still-in-flight render for the previous selection is superseded and
+    /// dropped by [`poll`].
+    ///
+    /// Callers that represent a selection / view change (navigation, cycle, re-root, …) must
+    /// clear [`directory_diff_path`](Self::directory_diff_path) first so the sticky directory
+    /// mode does not survive a move. The directory-diff toggle itself sets the path then calls
+    /// this; baseline toggle / refresh leave the path so the directory view re-renders against
+    /// the new git state.
     fn dispatch_render(&mut self) {
         self.latest_seq += 1;
         let seq = self.latest_seq;
@@ -2533,6 +2558,26 @@ impl Controller {
         // carry onto new content. Scrolling keeps it — it doesn't dispatch, and the coords stay valid.
         self.content_selection = None;
 
+        // Sticky directory-diff mode: keep showing the directory's unified diff (via delta)
+        // while the selection still lives under that directory. Navigating into a different
+        // directory (or re-rooting) drops the mode automatically; baseline/refresh keep it.
+        if let Some(dir) = self.directory_diff_path.clone() {
+            if self.current_directory().as_ref() == Some(&dir) {
+                let rel = self.rel(&dir).unwrap_or_else(|| PathBuf::from(""));
+                return self.queue_render_job(RenderJob {
+                    seq,
+                    path: dir,
+                    rel: Some(rel),
+                    mode: ViewMode::Diff,
+                    baseline: self.baseline,
+                    is_git: self.is_git_repo,
+                    directory_diff: true,
+                    wrap_width: self.md_wrap_width(),
+                });
+            }
+            self.directory_diff_path = None;
+        }
+
         let Some(node) = self.tree.selected() else {
             // No visible node: an empty tree or a filter (changed-only, gitignore, etc.)
             // that matched nothing. Show guidance instead of a blank pane.
@@ -2557,19 +2602,21 @@ impl Controller {
         // rendered content instead of stranding the pane on a `Rendering…` placeholder that
         // no result will ever arrive to clear (`poll` only clears `content_rendering` when a
         // matching result lands). The send never panics, so the viewer stays alive either way.
-        if self
-            .job_tx
-            .send(RenderJob {
-                seq,
-                path: node.path,
-                rel,
-                mode,
-                baseline: self.baseline,
-                is_git: self.is_git_repo,
-                wrap_width: self.md_wrap_width(),
-            })
-            .is_ok()
-        {
+        self.queue_render_job(RenderJob {
+            seq,
+            path: node.path,
+            rel,
+            mode,
+            baseline: self.baseline,
+            is_git: self.is_git_repo,
+            directory_diff: false,
+            wrap_width: self.md_wrap_width(),
+        });
+    }
+
+    /// Enqueue a [`RenderJob`] and, on success, put the loading placeholder in the content pane.
+    fn queue_render_job(&mut self, job: RenderJob) {
+        if self.job_tx.send(job).is_ok() {
             self.content = Text::raw("Rendering\u{2026}");
             self.content_notices.clear();
             self.content_source = None; // the placeholder has no source; the landing render brings its own
@@ -2621,13 +2668,13 @@ impl Controller {
                 if is_reflow {
                     self.content_scroll = self.content_scroll.min(self.max_content_scroll());
                 }
-                // the body has landed — now switch the title to match it. The latest
-                // dispatched render always corresponds to the current tree selection (every
-                // selection change calls `dispatch_render`), so the applied result's file is the
-                // selected node. A stale result for a superseded selection was dropped above by
-                // the `seq == latest_seq` guard, so this never points `content_path` at a file
-                // the user has already moved past. The render is no longer in flight.
-                self.content_path = self.tree.selected().map(|n| n.path.clone());
+                // the body has landed — now switch the title to match it. Directory-diff mode
+                // titles the pane with the directory; otherwise the selected file. A stale result
+                // for a superseded selection was dropped above by the `seq == latest_seq` guard.
+                self.content_path = self
+                    .directory_diff_path
+                    .clone()
+                    .or_else(|| self.tree.selected().map(|n| n.path.clone()));
                 self.content_rendering = false;
                 applied = true;
                 // A queued go-to-line jump (auto-switch from a transformed view, AC-7) applies once
