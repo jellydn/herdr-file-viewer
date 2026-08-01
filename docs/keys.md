@@ -12,6 +12,7 @@ is additive and on by default.
 | Key | Action |
 | --- | --- |
 | `↑` / `k`, `↓` / `j` | Move the tree cursor, or **scroll the content pane** vertically when it is focused |
+| `Space` / `PageDown`, `PageUp` | Move **one screenful** — page the content pane when it is focused, otherwise jump the tree cursor a page. The step is the focused pane's live height, so it follows a resize and stays a screenful in the narrow single-column layout. `Space` for page-down matches the pager convention (`less`, `more`, `man`, and so `bat`); `less`'s page-up `b` is unavailable here because it is `toggle_baseline`, so remap `page_up` if you want it |
 | `→` / `l` | Expand the selected directory, or **scroll the content pane right** when it is focused |
 | `←` / `h` | Collapse the selected directory, or **scroll the content pane left** when it is focused |
 | `H` (Shift+`h`) | Scroll the **tree** pane left (long / deeply-nested rows), inert unless the tree is focused |
@@ -23,6 +24,7 @@ is additive and on by default.
 | `c` | Toggle changed-files-only (baseline-aware: follows `b`) |
 | `d` | **Git-status mode** (toggle): restrict the tree to current working-tree status (`M`/`A`/`?`/`D`) and force working-tree diffs in the content pane (file or directory-scoped). Mutually exclusive with `c`; press `d` again to leave |
 | `b` | Toggle the diff baseline (base branch ⇄ `HEAD`) — used by `c` and normal diffs; while `d` is on, content stays working-tree |
+| `D` (Shift+`d`) | Cycle diff presentation — `delta` unified → side-by-side → plain, unstyled `git diff` text → back to unified (in Diff/FullDiff views) |
 | `v` | Cycle the content view mode |
 | `e` | Open the selected file in `$EDITOR` (see [Opening in an editor](#opening-in-an-editor)) |
 | `O` (Shift+`o`) | **Open with default app**: hand the selected file or directory to the OS default application (e.g. an image opens in the system viewer). Read-only hand-off; non-blocking (the viewer keeps running) |
@@ -31,6 +33,7 @@ is additive and on by default.
 | `:` | **Go to line**: open a prompt and jump the content pane to a source line by number (`Enter` jumps, `Esc` cancels; out-of-range clamps to the last line). Works in any view; in a rendered-markdown or diff view, confirming switches to the line-numbered content view and jumps there |
 | `/` | **Search in file**: open a prompt and highlight every match in the content pane as you type; `Enter` commits the search (highlights persist), `Esc` clears it and restores the scroll. Smartcase (a lowercase query is case-insensitive; a capital makes it case-sensitive). Works in any view |
 | `n` / `N` (Shift+`n`) | After a committed search, jump to the **next** / **previous** match and scroll it into view, wrapping at the ends with a notice |
+| `]` / `[` | Jump the tree cursor to the **next** / **previous** changed file, wrapping at the ends with a notice — step through a review one file at a time instead of arrowing past directory rows. Walks the same set the tree filters by (working-tree status while `d` is on, else the baseline-aware set behind `c` / `b`), in the order the tree lists them top-to-bottom, and expands a collapsed directory to reach a changed file inside it. It stays inside the tree you have filtered to: a changed file your current filters hide (`.`, `i`) is skipped rather than revealed, so `]` never turns a filter off behind your back. Inert outside a git repo; with nothing changed it says so |
 | `y` | Copy the selected file's **repo-relative** path to the clipboard (e.g. `src/app.rs`) |
 | `Y` | Copy the selected file's **absolute** path to the clipboard |
 | `a` | **Add annotation**: open the annotation editor for the selected file (`←`/`→` or `Home`/`End` move the text cursor, `Enter` saves, `Esc` cancels). Annotations live only for this viewer session and never modify the file |
@@ -64,10 +67,22 @@ changes you make outside it (a merge, pull, or commit in another pane) show up a
 forces a full refresh on demand. (Focus-refresh updates the tree's status without disturbing your
 content scroll.)
 
-Character keys act only when no control chord is held (so terminal chords like `Ctrl+C` are
-never intercepted); `Shift` is permitted, for keys such as `<` and `>` (and `a`/`A`, `y`/`Y`,
-`W`, `N`, `O`, `R`, `Z`, `?`, `H`/`L`, `J`/`K` in line-select mode, and `d`/`D` in the annotation
-overview).
+Character keys with a control modifier are normally inert, so terminal chords such as `Ctrl+C` do
+not trigger a viewer action; `Shift` is permitted for keys such as `<` and `>` (and `a`/`A`,
+`y`/`Y`, `W`, `N`, `O`, `R`, `Z`, `?`, `H`/`L`, `J`/`K` in line-select mode, and `d`/`D` in the
+annotation overview).
+
+**On Windows only**, `Ctrl+Alt`+character (with optional `Shift`) is treated as typing (AltGr), not
+as a chord. Crossterm 0.29's Windows input path reports AltGr as the generic `Ctrl+Alt` combination,
+so a genuine Windows `Ctrl+Alt`+character chord is ambiguous with AltGr typing a bound character:
+pressing AltGr+`?` on a Brazilian ABNT2 keyboard still opens (or closes) the help overlay, and the
+same applies to whatever character any of your bindings use, including a custom `[keys]` remap.
+(Some layouts produce other characters via AltGr too, e.g. `[`/`]` on German and Spanish ones; those
+are unbound by default, so they trigger nothing unless you bind them yourself.) `Ctrl` alone, `Alt`
+alone, `Ctrl+Alt` on a non-character key (`Ctrl+Alt+↑`), and `Ctrl+Alt` plus any modifier other than
+optional `Shift` stay inert. Linux and macOS decoding is unchanged. To prevent a particular Windows
+`Ctrl+Alt` chord from triggering its viewer action, rebind that action off the character in
+[`[keys]`](configuration.md#keybindings).
 
 ### Copy a path (`y` / `Y`)
 
@@ -116,6 +131,7 @@ The viewer is keyboard-first; the mouse is additive and on by default:
 | **Click** a tree row | Select it (focus the tree) |
 | **Double-click** a folder | Expand / collapse it (same as `Enter`) |
 | **Double-click** a file | Open it in **zoom mode**: content full-screen (same as `Enter`); the editor is the `e` key |
+| **Double-click** the content title | Toggle zoom: hide or show the tree (same as `z`). The filename sits on the content pane’s top border, so this works even when the tree is already hidden |
 | **Wheel** over the content pane | Scroll it vertically; over the tree, move the selection |
 | **Horizontal wheel / swipe** | Scroll the content, or the tree, sideways (terminal-dependent, see below) |
 | **Drag** a scrollbar | Scroll that pane: drag ↕ on a vertical bar, ↔ on a horizontal bar; pressing the track jumps there |

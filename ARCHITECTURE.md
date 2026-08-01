@@ -12,9 +12,9 @@ herdr panes: herdr opens it as one split pane and the viewer owns the whole rect
 keeps focus, layout, and keyboard routing entirely in-process (no cross-pane IPC for the core
 UX), at the cost of drawing the two-column layout ourselves.
 
-The crate is a **library + a thin binary**: `src/main.rs` is a few lines that either prints a
-launcher decision (for the shell launch scripts) or calls `lib::run()`; everything testable
-lives in the library modules.
+The crate is a **library + a thin binary**: `src/main.rs` dispatches on `open_target::parse_args`
+(launch-decision modes print a decision for the shell scripts; otherwise `lib::run(open_flag)`).
+Everything testable — including argv parsing — lives in the library modules.
 
 ## Components
 
@@ -29,7 +29,7 @@ is unit-testable with stubs.
 | `git` | Read-only git queries: status, baseline selection, changed-set, per-file diff. The **only** module that shells out to `git`, and only with read-only subcommands. |
 | `herdr` | The herdr CLI seam (`$HERDR_BIN_PATH`): read-only queries (list git worktrees / which workspaces have an active agent) plus a best-effort host **layout** command (`pane zoom --current --on`/`--off`, the `Z` full-screen toggle). Neither touches file or git state; an absent or failing herdr degrades gracefully (git-only picker; in-pane zoom only). |
 | `worktree` | Enumerate the repo's git worktrees (`git worktree list --porcelain`) and overlay herdr's agent-active workspace + per-row agent status, feeding the switch-worktree picker. |
-| `tree` | The rooted, `.gitignore`-aware file tree: filters (gitignored, changed-only, hidden/dotfiles), cursor, expansion, status markers. |
+| `tree` | The rooted, `.gitignore`-aware file tree: filters (gitignored, changed-only, hidden/dotfiles), cursor, expansion, status markers, and the `]` / `[` changed-file jump. Optionally folds a chain of single-child directories into one row (`compact_dirs`). A folded row has to look inside a **collapsed** directory, which the tree never opens otherwise, so foldability is answered by a two-entry probe rather than a listing and the answer is memoized — re-probed wherever the controller re-reads git. Listings stay uncached, so a compacted frame reads exactly the directories an uncompacted one does. |
 | `view_policy` | A pure decision: which view mode a file gets (changed → diff, markdown → rendered, else → syntax content) and the cycle order. |
 | `render` | Produce the content-pane text: classify the file, delegate styling to an external CLI, and **neutralize escape sequences** before display. |
 | `presenter` | Draw the two-column (or zoomed / narrow) layout with ratatui, including persistent annotation markers and background-only styling; source-line backgrounds are applied beneath active line-select, ambient-selection, and search overlays, with a bounded one-cell cue for blank annotated lines. Scroll the tree/content and report viewport + pane geometry back for hit-testing. |
@@ -55,15 +55,18 @@ is unit-testable with stubs.
 | `editor` | Hand a file off to `$EDITOR`, or the config's `editor` override (launch only — never reads or writes the file). |
 | `opener` | Read-only OS hand-off for the `O` / `R` keys: a pure per-OS argv builder (open-with-default-app / reveal-in-file-manager, overridable via the config's `open` / `reveal` keys) plus an `Opener` seam over the reused editor `Spawner`, spawned **non-blocking** (no terminal takeover, stdio nulled) so the TUI keeps running. |
 | `launch` | The "launch-or-focus-or-toggle" decision behind the shell launch scripts (pure, hermetically testable). |
+| `open_target` | Pure argv parse (`parse_args`), open-target parse/resolve (`path` / `path:line` from CLI `--open` or `HERDR_FILE_VIEWER_OPEN`, lexically normalized under the root), and helpers; the controller applies a target once at startup via reveal + optional pending go-to-line. |
 
 ## Data flow
 
 ```
-herdr → env (HERDR_PLUGIN_CONTEXT_JSON)
+herdr → env (HERDR_PLUGIN_CONTEXT_JSON, optional HERDR_FILE_VIEWER_OPEN)
           │
    host::from_env → root::resolve → git::default_baseline
           │
    Controller::new  ── wires live GitService / ContentProvider / EditorHandoff / Clipboard behind traits
+          │
+   optional open target (CLI --open > HERDR_FILE_VIEWER_OPEN) → reveal + render [+ pending go-to-line]
           │
    event loop (app::run):  draw → poll input → handle(intent) → drain finished renders → repeat
 ```

@@ -8,7 +8,29 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
-- Git-status mode (`d`): filter the tree to current working-tree status and force working-tree diffs (file or directory-scoped); sticky until `d` again, mutually exclusive with baseline-aware `c`. → [usage](docs/usage.md#git-awareness) · [keys](docs/keys.md)
+- Bundled `herdr-file-viewer` agent skill: agents can resolve a file, source location, or function definition and open it in a fresh Files pane. Includes safe target handling, an explicit user-confirmation prompt for proactive offers, and platform guidance. → [agent skill](skills/herdr-file-viewer/SKILL.md) · [usage](docs/usage.md#teach-your-agent)
+- `show_ignored`: show gitignored (and git-excluded) files at startup, exactly as if the `i` key had already been pressed once. `.git/` stays hidden regardless, and the `i` key still toggles the state during the session. Off by default. Thanks @leonfox28 for the suggestion (#119) → [configuration](docs/configuration.md)
+- `compact_dirs`: draw a chain of single-child directories as one row (`src/main/java/br/com` instead of six indented rows), in both the full tree and the changed-only view. Off by default; worth turning on when your paths are deeper than your pane is wide. → [configuration](docs/configuration.md) · [usage](docs/usage.md#the-tree)
+- `]` / `[` jump the tree cursor to the next / previous changed file, wrapping at the ends with a notice — `n`/`N` for the tree instead of arrowing past directory rows. Walks the set the tree is filtered by (working-tree status under `d`, else the baseline-aware set behind `c` / `b`) and expands a collapsed directory to reach a changed file inside it. → [usage](docs/usage.md#git-awareness) · [keys](docs/keys.md)
+- Page-wise scrolling: `Space` / `PageDown` move down one screenful and `PageUp` moves up one, paging the content pane when it is focused and the tree cursor otherwise. The step is the focused pane's live height, so it follows a resize and stays a screenful in the narrow single-column layout. `Space` follows the pager convention (`less`, `more`, `man`, and so `bat`); both are remappable as `page_down` / `page_up`. → [keys](docs/keys.md) · [configuration](docs/configuration.md#keybindings)
+
+### Fixed
+- Windows: `config.toml` is read again. The Windows launchers spawn the viewer by absolute path (they cannot use the manifest's relative pane command), so the pane never received `HERDR_PLUGIN_CONFIG_DIR`; the viewer then fell back to `$XDG_CONFIG_HOME` / `$HOME`, which Windows does not set, resolved a relative path, and correctly refused to read it. Every key — `editor`, `tree_width`, `tree_max_cols`, the lot — was silently ignored. The launchers now pass the directory through, and a standalone run falls back to `%USERPROFILE%\.config\herdr-file-viewer\config.toml`. → [configuration](docs/configuration.md#file-location)
+
+- Tree rows now indent by depth alone. A file row reserved no space for the expand arrow, so a file sat two columns left of a directory at the same depth — putting every file in the exact column of its parent directory's name, and every top-level file two columns left of the directory beside it. Files now reserve the arrow's width, so siblings line up and a child always reads one level in from its parent. → [usage](docs/usage.md#the-tree)
+
+- **Windows only:** AltGr characters now trigger their bound actions; only `Ctrl+Alt` plus optional `Shift` on character keys is inferred as AltGr. → [keys](docs/keys.md)
+
+## [1.14.0] - 2026-07-20
+
+### Added
+- Launch open target: open straight to a file (and optional line) via `--open <path>[:line]` or `HERDR_FILE_VIEWER_OPEN` (flag wins). Same `path:line` shape as a copied line reference. Teach your agent the flag and you can just ask it to open a file, jump to a line, or show a function in the viewer. Thanks @tieubao for the suggestion (#109). → [usage](docs/usage.md#open-at-a-known-file) · [teach your agent](docs/usage.md#teach-your-agent)
+- Double-click the content pane title (filename border) to toggle zoom / show or hide the tree (same as `z`). Complements double-clicking a file in the tree to open zoomed. Thanks @nullbio for the suggestion (#106). → [keys](docs/keys.md#mouse)
+- `D` cycles changed-file diffs through Delta unified, Delta side-by-side, and plain git diff presentation. Thanks @rrrrnmtsu (#111). → [usage](docs/usage.md#git-awareness) · [keys](docs/keys.md)
+- Git-status mode (`d`): filter the tree to current working-tree status and force working-tree diffs (file or directory-scoped); sticky until `d` again, mutually exclusive with baseline-aware `c`. Thanks @jellydn (#110). → [usage](docs/usage.md#git-awareness) · [keys](docs/keys.md)
+
+### Fixed
+- Diff and full-file-diff panes now pass the pane width to Delta, so side-by-side diffs size their columns to the pane instead of a fixed fallback, and re-render on resize. Thanks @rrrrnmtsu (#111).
 
 ## [1.13.0] - 2026-07-16
 

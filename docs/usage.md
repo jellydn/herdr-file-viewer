@@ -6,6 +6,7 @@ customize it see [configuration](configuration.md).
 
 - [The tree](#the-tree)
 - [Finding a file fast](#finding-a-file-fast)
+- [Open at a known file](#open-at-a-known-file) (incl. [Teach your agent](#teach-your-agent))
 - [Viewing a file](#viewing-a-file)
 - [Git awareness](#git-awareness)
 - [Navigating within a file](#navigating-within-a-file)
@@ -21,8 +22,10 @@ customize it see [configuration](configuration.md).
 
 The left column is a recursive, expandable directory tree, **rooted at the worktree root** when you
 launch inside a git repo, otherwise at the launch directory. It honors `.gitignore` (press `i` to
-reveal ignored files), and a separate toggle (`.`) hides dot-prefixed "hidden" files and folders
-when a directory is full of them. The tree's **top border names the root** directory and its
+reveal ignored files, or set [`show_ignored = true`](configuration.md) to start with them visible),
+and a separate toggle (`.`) hides dot-prefixed "hidden" files and folders when a directory is full
+of them. Ignored paths often contain local credentials or generated secrets, so keep the startup
+setting off unless you need it; `.git/` itself always stays hidden. The tree's **top border names the root** directory and its
 **bottom border shows the current branch**, so you always know *where* and *on what branch* you're
 looking.
 
@@ -32,11 +35,126 @@ names — reachable by keyboard with `H` / `L` when the tree is focused. A scrol
 there's more than fits. Narrow or widen the tree column with `<` / `>`, or drag the divider; the
 starting split, the tree's side, and a column cap are all [configurable](configuration.md).
 
+On a **deeply nested** layout the per-segment tree spends most of a narrow column on indentation, and
+the file names — the part you came for — are what gets truncated. Set
+[`compact_dirs = true`](configuration.md) to draw a chain of single-child directories as one row:
+`src/main/java/br/com` instead of six rows, each indented two columns further than the last. The row
+leads into the deepest directory of the chain, so expanding, collapsing, and status colors all act on
+that one, and the chain stops the moment a directory holds a file or a second entry.
+
 ## Finding a file fast
 
 Press `f` to open a **fuzzy finder** over every file in the tree (`.gitignore`-aware). Type to
 filter, `↑`/`↓` to move, `Enter` to open, `Esc` to cancel — far faster than scrolling the tree in a
 large repo.
+
+## Open at a known file
+
+When something **already knows** the path (and maybe the line), you can start the viewer on that
+file instead of landing on the tree and navigating by hand. This is for agents, companion plugins,
+and scripts — day-to-day browsing is unchanged (`f`, `:`, the tree).
+
+The launch **open target** is a path under the tree **root** (repo-relative is the usual form;
+absolute paths under the root are also accepted), optionally with a 1-based line — the same shape
+a **line reference** copies with `L` (`src/app.rs` or `src/app.rs:42`). Every successful open shows a
+short status notice (`Opened path`, `Opened path:N`, or `Opened path:A-B`).
+
+A **range** form (`src/app.rs:10-20`) also:
+
+- jumps to the **start** line
+- paints a soft highlight on lines 10–20 for about **1 second**
+
+Path-only and single-line opens do not use that highlight (scroll + notice is enough).
+
+Two ways to pass it (the flag wins if both are set):
+
+| Surface | Example |
+| --- | --- |
+| CLI flag | `herdr-file-viewer --open src/app.rs:42` |
+| Environment | `HERDR_FILE_VIEWER_OPEN=src/app.rs:42` |
+
+### Companion or agent (usual case)
+
+Ask an agent (or a small companion plugin) to open a place in the **file viewer** instead of
+pasting a path into chat. Once the agent knows how (see [Teach your agent](#teach-your-agent)
+below), natural requests work when it can resolve a real path:
+
+- “Open the file that’s breaking in the file viewer.” (needs an error/log in context)
+- “Show me line 210 of `src/app.rs` in the file viewer.”
+- “Open `handle_finder_click` in the file viewer.”
+- “Show me the `render` function in the file viewer.”
+- “Open the failing test at `tests/tree.rs:149`.”
+- “Jump to this range in the viewer: `src/controller/finder.rs:141-150`.”
+
+The agent resolves that to a repo-relative `path` or `path:line` (or range), then launches the
+viewer with `HERDR_FILE_VIEWER_OPEN` (no fuzzy-finder key-scripting). You get a Files pane on that
+file, content loaded, viewport on the line. If the pane is too narrow to show the content column
+(tree-only layout), the viewer **zooms** the file automatically — same as confirming the fuzzy
+finder in a narrow split.
+
+### Teach your agent
+
+Agents do **not** know this surface by default. This repository includes a
+[ready-to-copy agent skill](../skills/herdr-file-viewer/SKILL.md) with the target-resolution,
+launch, and conversation rules. Use it where your agent runner supports skills, or paste the short
+block below into your project’s `AGENTS.md` (preferred: every agent reads it) or `CLAUDE.md` so
+“open in the file viewer” means something concrete:
+
+````markdown
+## File viewer (herdr-file-viewer)
+
+When the user asks to open something "in the file viewer" / "in Files":
+1. Resolve to a repo-relative path (and line if known) from errors, grep, chat, or a line reference.
+2. Launch (do not key-script the TUI):
+
+```bash
+herdr plugin pane open \
+  --plugin herdr-file-viewer \
+  --entrypoint file-viewer \
+  --placement split \
+  --direction right \
+  --cwd "$PWD" \
+  --focus \
+  --env "HERDR_FILE_VIEWER_OPEN=<path>[:line]"
+```
+
+Examples: `src/app.rs`, `src/app.rs:42`, `src/app.rs:10-20`. Treat the target as one data value,
+not shell source: prefer a structured argv or process API, or shell-escape it before assigning and
+expanding it only within double quotes.
+
+The Herdr pane command applies to Linux, macOS, and WSL. On native Windows preview, the Files action
+cannot accept an open target, so use WSL for this flow or, if the binary is on `PATH`, run
+`herdr-file-viewer.exe --open "<target>"` in a terminal devoted to the viewer. Outside herdr, with
+the binary on `PATH`: `herdr-file-viewer --open <path>[:line]`.
+````
+
+Without that (or an equivalent skill), a vague “open it in the file viewer” is only a wish: the
+agent has no standard way to discover `--open` / `HERDR_FILE_VIEWER_OPEN`.
+
+### Run the binary yourself
+
+Useful for a local `cargo run`, a shell alias, or a Windows-style `pane run`:
+
+```bash
+herdr-file-viewer --open src/app.rs:42
+# or
+HERDR_FILE_VIEWER_OPEN=src/app.rs:42 herdr-file-viewer
+# path only (open at the top of the file)
+herdr-file-viewer --open docs/usage.md
+```
+
+### Round-trip with the viewer
+
+Copy a location with `L` (a `path:line` or `path:start-end` line reference), then later pass that
+string as `--open` or `HERDR_FILE_VIEWER_OPEN` to land on the same place.
+
+### When the path is wrong
+
+A missing file, a non-file, or a path outside the tree root does **not** crash the viewer: it still
+opens, shows a short notice (e.g. `Could not open …`), and leaves the tree selection unchanged.
+
+This is launch-only. It does not retarget a Files pane that is already running; open a fresh pane
+(or close and reopen) when you need a new target.
 
 ## Viewing a file
 
@@ -54,7 +172,8 @@ numbers. No mode-switching, no commands.
   fit-to-pane view (wide tables sized to fit, over-long cells shown as `…`) and a wide view that
   renders tables at full width and scrolls sideways.
 - **Zoom** with `z` to hide the tree and read the file across the full pane; press again (or
-  `q`/`Esc`) to restore the split.
+  `q`/`Esc`) to restore the split. You can also **double-click the content pane title** (the
+  filename on the top border) to toggle the same zoom without the key.
 - **Full-screen** with `Z` (Shift+`z`) to open the file *and* zoom the viewer's herdr pane to fill
   the whole terminal — the file takes over the entire screen, not just the split. `Z` again (or
   `Esc`/`q`/`z`) returns to the split.
@@ -73,6 +192,15 @@ Git status is woven straight into the tree, not a separate mode:
   as a non-color cue so status survives a colorblind palette or a non-default terminal theme.
 - **Changed-files-only filter**: press `c` to restrict the tree to files changed against the active
   baseline (`b`) — useful for reviewing a whole branch (merge-base) or just uncommitted work (`HEAD`).
+- **Step through the changed files**: press `]` / `[` to jump the tree cursor straight to the next
+  or previous changed file, wrapping at the ends with a notice. It walks whichever set the tree is
+  filtered by — the working-tree status while `d` is on, else the baseline-aware set behind `c` and
+  `b` — in the order the tree lists those files top-to-bottom, and expands a collapsed directory
+  when the next changed file lives inside one, so it works in the full tree as well as under `c`.
+  It stays inside the tree you have filtered to: a changed file hidden by `.` (hidden files) or `i`
+  (gitignored) is skipped rather than revealed, so the jump never switches a filter off behind your
+  back. This is `n`/`N` for the tree: reviewing a branch is a walk over the changed files, and in a
+  deeply nested repo that walk is otherwise a long run of `j` presses past directory rows.
 - **Git-status mode**: press `d` to filter the tree to **current working-tree status only**
   (modified, staged, untracked, deleted — independent of baseline) and force working-tree diffs in
   the content pane. On a directory, that means a unified diff of all tracked changes under it.
@@ -80,6 +208,10 @@ Git status is woven straight into the tree, not a separate mode:
 - **Diff baseline**: press `b` to flip what "changed" and the normal/file-cycle diffs compare against
   — the merge-base of your branch versus `HEAD`. While git-status mode (`d`) is on, content stays
   working-tree; `b` still updates the stored baseline for when you leave `d` or use `c`.
+- **Diff presentation**: in a changed file's Diff or FullDiff view, press `D` to cycle Delta's
+  unified output, Delta side-by-side output, and plain unstyled git diff. Side-by-side is applied
+  only when the configured diff renderer is Delta; custom renderers remain unchanged. The setting
+  is presentation-only and does not change the selected baseline or git data.
 - **Refresh**: the viewer re-reads git status automatically when the pane regains focus, so a merge,
   pull, or commit you make elsewhere shows up on its own; `r` forces a full refresh on demand.
 

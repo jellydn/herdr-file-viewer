@@ -117,6 +117,16 @@ pub struct Config {
     pub open: Option<String>,
     pub reveal: Option<String>,
     pub hide_dotfiles: Option<bool>,
+    /// Whether gitignored (and git-excluded) entries are shown at startup, exactly as if `i` had
+    /// already been pressed once. `None` falls back to `false` (the default: ignored entries
+    /// hidden). `.git/` itself is never browsed regardless of this setting. The interactive `i`
+    /// toggle still flips the state during the session, starting from whichever value this seeds.
+    pub show_ignored: Option<bool>,
+    /// Whether a chain of single-child directories is drawn as ONE row (`src/main/java`) instead of
+    /// one row per segment. `None` falls back to `false` — the per-segment tree, unchanged. Worth
+    /// turning on for a deeply-nested layout (a Java/Maven `src/main/java/...`, a nested monorepo),
+    /// where the per-segment tree spends most of the column on indentation.
+    pub compact_dirs: Option<bool>,
     pub update_check: Option<bool>,
     /// Whether quitting with unexported session annotations confirms first. `None` falls back to
     /// `true`: annotations are session-only, so quitting destroys them, and the confirm is the only
@@ -191,8 +201,9 @@ pub fn parse_config(s: &str) -> (Config, LoadOutcome) {
 ///
 /// Precedence: `HERDR_PLUGIN_CONFIG_DIR` (non-empty) wins outright; otherwise fall back to the
 /// XDG-style `$XDG_CONFIG_HOME/herdr-file-viewer/config.toml`, or `$HOME/.config/herdr-file-viewer/config.toml`,
-/// or (no HOME) the relative `.config/herdr-file-viewer/config.toml` as a last resort. Empty-string
-/// env values are treated as absent, same as `host::parse_context` does for its context fields.
+/// or `%USERPROFILE%\.config\herdr-file-viewer\config.toml` on Windows, or (none of them set) the
+/// relative `.config/herdr-file-viewer/config.toml` as a last resort. Empty-string env values are
+/// treated as absent, same as `host::parse_context` does for its context fields.
 pub fn config_path(get: impl Fn(&str) -> Option<String>) -> std::path::PathBuf {
     if let Some(dir) = get("HERDR_PLUGIN_CONFIG_DIR").filter(|s| !s.is_empty()) {
         return std::path::PathBuf::from(dir).join("config.toml");
@@ -201,6 +212,13 @@ pub fn config_path(get: impl Fn(&str) -> Option<String>) -> std::path::PathBuf {
         std::path::PathBuf::from(xdg)
     } else if let Some(home) = get("HOME").filter(|s| !s.is_empty()) {
         std::path::PathBuf::from(home).join(".config")
+    } else if let Some(profile) = get("USERPROFILE").filter(|s| !s.is_empty()) {
+        // Windows sets neither XDG_CONFIG_HOME nor HOME, so without this the next arm is a
+        // RELATIVE path — which `load_config` refuses to read — and a standalone Windows run has
+        // no way to have a config file at all. `USERPROFILE` is the platform's own answer to the
+        // question `HOME` answers elsewhere; the `.config` layout is kept so the file sits where
+        // the docs already say it does.
+        std::path::PathBuf::from(profile).join(".config")
     } else {
         std::path::PathBuf::from(".config")
     };
@@ -266,6 +284,13 @@ pub struct EffectiveSettings {
     pub open: Option<Vec<String>>,
     pub reveal: Option<Vec<String>>,
     pub hide_dotfiles: bool,
+    /// The effective **show-ignored-at-startup** switch: the config `show_ignored` when present,
+    /// else `false`. Seeds the tree exactly as if `i` had already been pressed once; the
+    /// interactive `i` toggle still flips it during the session. Config-or-default (no env var).
+    pub show_ignored: bool,
+    /// The effective **compact directory chains** switch: the config `compact_dirs` when present,
+    /// else `false`. Seeds the tree at startup. Config-or-default (no env var).
+    pub compact_dirs: bool,
     pub update_check: bool,
     /// The effective **confirm-before-discarding-annotations** switch: the config
     /// `confirm_discard` when present, else `true`. Config-or-default (no env var).
@@ -340,6 +365,15 @@ pub fn resolve(config: &Config, get_env: impl Fn(&str) -> Option<String>) -> Eff
 
     let hide_dotfiles = config.hide_dotfiles.unwrap_or(false);
 
+    // Config > default; no env var. Defaults OFF: ignored (and git-excluded) entries stay hidden
+    // unless asked for, matching the interactive `i` toggle's own default state.
+    let show_ignored = config.show_ignored.unwrap_or(false);
+
+    // Config > default; no env var. Defaults OFF so the tree's shape is unchanged for everyone who
+    // does not ask for it: compaction is a real trade (fewer rows and far less indentation, but a
+    // row no longer maps 1:1 to a directory), and which side wins depends on how deep the repo is.
+    let compact_dirs = config.compact_dirs.unwrap_or(false);
+
     // Config > default; no env var. Defaults ON: the confirm only fires when annotations are held,
     // so a session that never annotates never sees it, and the one that does has work to lose.
     let confirm_discard = config.confirm_discard.unwrap_or(true);
@@ -413,6 +447,8 @@ pub fn resolve(config: &Config, get_env: impl Fn(&str) -> Option<String>) -> Eff
         open,
         reveal,
         hide_dotfiles,
+        show_ignored,
+        compact_dirs,
         update_check,
         confirm_discard,
         scroll_lines,
@@ -524,6 +560,35 @@ mod tests {
     }
 
     #[test]
+    fn userprofile_fallback_when_config_dir_xdg_and_home_absent() {
+        // The Windows case: neither XDG_CONFIG_HOME nor HOME is set, so without this arm the path
+        // is relative and `load_config` refuses to read it — no config file is reachable at all.
+        let get = |k: &str| match k {
+            "USERPROFILE" => Some(r"C:\Users\u".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            config_path(get),
+            std::path::PathBuf::from(r"C:\Users\u").join(".config/herdr-file-viewer/config.toml")
+        );
+    }
+
+    #[test]
+    fn home_wins_over_userprofile() {
+        // A cross-platform shell (Git Bash, WSL interop) can set both. HOME is the more specific
+        // signal — it was chosen by the environment, not defaulted by the OS — so it stays ahead.
+        let get = |k: &str| match k {
+            "HOME" => Some("/home/u".to_string()),
+            "USERPROFILE" => Some(r"C:\Users\u".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            config_path(get),
+            std::path::PathBuf::from("/home/u/.config/herdr-file-viewer/config.toml")
+        );
+    }
+
+    #[test]
     fn empty_config_dir_falls_through_to_xdg_fallback() {
         let get = |k: &str| match k {
             "HERDR_PLUGIN_CONFIG_DIR" => Some("".to_string()),
@@ -549,6 +614,7 @@ mod tests {
         assert_eq!(config.update_check, None);
         assert_eq!(config.confirm_discard, None);
         assert_eq!(config.scroll_lines, None);
+        assert_eq!(config.show_ignored, None);
         assert_eq!(outcome, LoadOutcome::Loaded);
     }
 
@@ -589,11 +655,65 @@ mod tests {
 
     #[test]
     fn bool_fields_parse() {
-        let (config, _outcome) =
-            parse_config("hide_dotfiles = true\nupdate_check = false\nconfirm_discard = false\n");
+        let (config, _outcome) = parse_config(
+            "hide_dotfiles = true\nupdate_check = false\nconfirm_discard = false\nshow_ignored = true\n",
+        );
         assert_eq!(config.hide_dotfiles, Some(true));
         assert_eq!(config.update_check, Some(false));
         assert_eq!(config.confirm_discard, Some(false));
+        assert_eq!(config.show_ignored, Some(true));
+    }
+
+    #[test]
+    fn show_ignored_resolves_config_over_default() {
+        // Issue #119: `show_ignored` seeds the tree's `i` filter at startup, same shape as
+        // `compact_dirs`/`confirm_discard` above -- absent falls to off, config wins when set.
+        let (config, _outcome) = parse_config("show_ignored = true\n");
+        assert_eq!(config.show_ignored, Some(true));
+
+        let off = resolve(&Config::default(), |_| None);
+        assert!(
+            !off.show_ignored,
+            "absent falls back to off — ignored entries stay hidden unless asked for"
+        );
+
+        let on = resolve(
+            &Config {
+                show_ignored: Some(true),
+                ..Config::default()
+            },
+            |_| None,
+        );
+        assert!(on.show_ignored, "config wins");
+
+        // No env tier: like confirm_discard, this is a config-or-default UI preference, so a stray
+        // environment variable must not reach it.
+        let env_ignored = resolve(&Config::default(), |_| Some("1".to_string()));
+        assert!(
+            !env_ignored.show_ignored,
+            "no environment variable participates in this key"
+        );
+    }
+
+    #[test]
+    fn compact_dirs_resolves_config_over_default() {
+        let (config, _outcome) = parse_config("compact_dirs = true\n");
+        assert_eq!(config.compact_dirs, Some(true));
+
+        let off = resolve(&Config::default(), |_| None);
+        assert!(
+            !off.compact_dirs,
+            "absent falls back to off — the tree's shape is unchanged unless asked for"
+        );
+
+        let on = resolve(
+            &Config {
+                compact_dirs: Some(true),
+                ..Config::default()
+            },
+            |_| None,
+        );
+        assert!(on.compact_dirs, "config wins");
     }
 
     #[test]
@@ -845,6 +965,7 @@ mod tests {
         assert_eq!(effective.editor, None);
         assert!(effective.update_check);
         assert!(!effective.hide_dotfiles);
+        assert!(!effective.show_ignored, "ignored entries hidden by default");
         assert!(
             effective.confirm_discard,
             "the quit guard defaults ON: annotations are session-only, so the confirm is the only \
@@ -870,6 +991,7 @@ mod tests {
         assert_eq!(effective.editor, Some(std::ffi::OsString::from("code")));
         assert!(effective.update_check);
         assert!(!effective.hide_dotfiles);
+        assert!(!effective.show_ignored);
         assert_eq!(effective.markdown, None);
         assert_eq!(effective.diff, None);
         assert_eq!(effective.syntax, None);

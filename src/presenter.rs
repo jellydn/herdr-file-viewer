@@ -26,6 +26,13 @@ pub enum Focus {
     Content,
 }
 
+/// A self-expiring status hint. `dim` is set once the flash enters its fade-out phase, so the
+/// Presenter can render it dimmed just before it disappears.
+pub struct FlashLine {
+    pub text: String,
+    pub dim: bool,
+}
+
 /// Everything the Presenter needs to draw one frame. Built by the Session Controller from
 /// the Tree Model (nodes + selection), Content Renderer (content + notices), and session
 /// focus/width. `width` is the pane width the controller observed (the narrow-split input
@@ -39,6 +46,9 @@ pub struct ViewState {
     pub content: Text<'static>,
     /// Non-fatal notices to surface (truncation AC-13, renderer fallback AC-25).
     pub notices: Vec<String>,
+    /// A self-expiring status hint (e.g. `D`'s diff-presentation label), drawn as one line atop
+    /// the notices strip and styled distinctly from a warning. `None` when nothing is flashing.
+    pub flash: Option<FlashLine>,
     /// Which column has focus.
     pub focus: Focus,
     /// The pane width the controller last observed (session state — e.g. for tracking the
@@ -211,6 +221,7 @@ pub struct ContentSearch {
 pub struct LineSelectView {
     /// The marker (cursor) line — where `Enter` will anchor the reference. Rendered with a distinct
     /// caret + the stronger current-match emphasis so the user sees exactly which line is active.
+    /// Ignored when [`passive`](Self::passive) is true.
     pub marker: usize,
     /// The ascending selection start (inclusive), 1-based.
     pub start: usize,
@@ -219,7 +230,12 @@ pub struct LineSelectView {
     /// The character-granular selection (a mouse drag), or `None` for a whole-line (keyboard)
     /// selection. When `Some`, the overlay highlights only the selected characters on the boundary
     /// lines (and the full code of any interior line) instead of the whole `[start, end]` rows.
+    /// Ignored when [`passive`](Self::passive) is true.
     pub char_sel: Option<CharSelView>,
+    /// When true, paint only a soft whole-line highlight on `[start, end]` (no ▶/│ gutter, no key
+    /// modal). Used for a launch open-target range flash so the range is visible without looking
+    /// like active line-select mode.
+    pub passive: bool,
 }
 
 /// A character-granular selection for the line-select overlay. `*_col` are char carets into the
@@ -354,8 +370,12 @@ fn status_marker(node: &Node) -> char {
     }
 }
 
-/// The display name of a node — its final path component, or the whole path for a root.
+/// The display name of a node — its explicit label when it carries one (a compacted directory
+/// chain, `src/main/java`), else its final path component, or the whole path for a root.
 fn node_name(node: &Node) -> String {
+    if let Some(label) = &node.label {
+        return label.clone();
+    }
     node.path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -440,11 +460,18 @@ const ANNOTATION_STYLE: Style = Style::new().bg(Color::DarkGray);
 
 /// Render one tree row: `<git><annotation><indent><glyph><name>`. The annotation marker replaces
 /// the reserved blank prefix cell, so git coexistence and row geometry stay unchanged.
+///
+/// A file's glyph is two BLANKS, not an empty string. The expand arrow is two columns wide, so
+/// without that placeholder a file's name starts two columns left of where a directory's name
+/// starts at the same depth — which puts a file at depth `d+1` in exactly the column of its parent
+/// directory at depth `d`, and puts a top-level file two columns left of the directory it sits
+/// beside. Reserving the width makes the column a node's name starts in a true function of its
+/// depth, so siblings line up and a child is always one level in from its parent.
 fn tree_row(node: &Node, selected: bool, annotated: bool) -> Line<'static> {
     let glyph = match node.kind {
         NodeKind::Dir if node.expanded => "▾ ",
         NodeKind::Dir => "▸ ",
-        NodeKind::File => "",
+        NodeKind::File => "  ",
     };
     let annotated = annotated && node.kind == NodeKind::File;
     let mut row_style = Style::new();
@@ -466,10 +493,25 @@ fn tree_row(node: &Node, selected: bool, annotated: bool) -> Line<'static> {
     } else {
         row_style
     };
-    Line::from(vec![
-        Span::styled(prefix, row_style),
-        Span::styled(sanitize_control(&node_name(node)), name_style),
-    ])
+    let mut spans = vec![Span::styled(prefix, row_style)];
+    let name = sanitize_control(&node_name(node));
+    // A compacted chain row (`src/main/java`) folds away the indentation that used to signal depth,
+    // so the row needs its own anchor: draw the leading segments DIM and the last one at full
+    // weight. The eye then lands on the directory the row actually leads into, with the path it
+    // came through as context. Only a labelled row splits — an ordinary name has no separator to
+    // split on, and its `label` is `None`, so every other row keeps exactly one span.
+    match node.label.is_some().then(|| name.rfind('/')).flatten() {
+        Some(cut) => {
+            let (head, tail) = name.split_at(cut + 1);
+            spans.push(Span::styled(
+                head.to_string(),
+                name_style.add_modifier(Modifier::DIM),
+            ));
+            spans.push(Span::styled(tail.to_string(), name_style));
+        }
+        None => spans.push(Span::styled(name, name_style)),
+    }
+    Line::from(spans)
 }
 
 /// Build a [`ScrollbarState`] that places the thumb correctly for a **scroll offset** (not a list
@@ -575,6 +617,13 @@ fn tree_bars(
     bar_layout(inner, needs_v, needs_h)
 }
 
+/// Total rows the notice strip occupies: the persistent notices plus the optional flash line.
+/// Used by both [`draw_content`] and [`geometry`] so the drawn strip and the hit-test geometry
+/// reserve the same rows.
+fn notice_strip_len(state: &ViewState) -> usize {
+    state.notices.len() + usize::from(state.flash.is_some())
+}
+
 /// Split the content block interior into the notices strip (top) and the content area (below it,
 /// where the file + its scrollbars are drawn). Shared by [`draw_content`] and [`geometry`].
 fn content_notice_split(inner: Rect, notices_len: usize) -> (Rect, Rect) {
@@ -666,6 +715,34 @@ fn apply_annotation_lines(lines: &[Line<'static>], ranges: &[LineRange]) -> Vec<
 /// stay aligned. The content text itself is never mutated — spans are cloned, only their style is
 /// patched, and lines scrolled off-screen are clipped by the `Paragraph` offset (clamp-to-visible).
 fn apply_line_select(lines: &[Line<'static>], ls: &LineSelectView) -> Vec<Line<'static>> {
+    // Passive range flash: highlight only, no ▶/│ gutter and no content column shift — keys stay
+    // normal; this is display-only (launch open-target ranges).
+    if ls.passive {
+        return lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let src = i + 1;
+                if src < ls.start || src > ls.end {
+                    return line.clone();
+                }
+                let style = crate::highlight::HIGHLIGHT;
+                let spans = line
+                    .spans
+                    .iter()
+                    .map(|s| Span {
+                        content: s.content.clone(),
+                        style: s.style.patch(style),
+                    })
+                    .collect();
+                Line {
+                    spans,
+                    style: line.style,
+                    alignment: line.alignment,
+                }
+            })
+            .collect();
+    }
     lines
         .iter()
         .enumerate()
@@ -840,7 +917,8 @@ fn draw_blank_annotation_cells(frame: &mut Frame, text: Rect, state: &ViewState)
 
     let scroll = state.content_scroll as usize;
     let visible_end = scroll.saturating_add(text.height as usize);
-    let prefix = usize::from(state.line_select.is_some());
+    // Active line-select adds a ▶/│ gutter column; passive range flash does not.
+    let prefix = usize::from(state.line_select.as_ref().is_some_and(|ls| !ls.passive));
     let mut display_row = 0usize;
     let mut range_index = 0usize;
     let mut painted = Vec::with_capacity(text.height as usize);
@@ -1031,13 +1109,28 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) -> (u16, u16) 
 
     // A notice strip (truncation AC-13, fallback AC-25) sits above the content, bounded so
     // it can never crowd out the file itself; the file + its scrollbars fill the area below it.
-    let (notices_rect, content_area) = content_notice_split(inner, state.notices.len());
+    // The self-expiring flash (if any) leads the strip, styled distinctly from a yellow warning
+    // (cyan, dimming to gray as it fades) so a status hint never reads as an error.
+    let (notices_rect, content_area) = content_notice_split(inner, notice_strip_len(state));
     if notices_rect.height > 0 {
-        let notice_lines: Vec<Line> = state
-            .notices
-            .iter()
-            .map(|n| Line::styled(sanitize_control(n), Style::new().fg(Color::Yellow)))
-            .collect();
+        let mut notice_lines: Vec<Line> = Vec::new();
+        if let Some(flash) = &state.flash {
+            let color = if flash.dim {
+                Color::DarkGray
+            } else {
+                Color::Cyan
+            };
+            notice_lines.push(Line::styled(
+                sanitize_control(&flash.text),
+                Style::new().fg(color),
+            ));
+        }
+        notice_lines.extend(
+            state
+                .notices
+                .iter()
+                .map(|n| Line::styled(sanitize_control(n), Style::new().fg(Color::Yellow))),
+        );
         frame.render_widget(Paragraph::new(notice_lines), notices_rect);
     }
 
@@ -1250,6 +1343,11 @@ pub struct PaneGeometry {
     pub tree_hbar: Option<Rect>,
     /// The content text interior (below the notices strip, minus any reserved scrollbar gutter).
     pub content_inner: Option<Rect>,
+    /// Hit rect for the content column's top border (filename title bar), full border width inset
+    /// by the left/right border glyphs. Used for double-click → toggle zoom (hide/show tree).
+    /// Named `*_rect` to distinguish it from [`ViewState::content_title`] (the filename string).
+    /// `None` when the content column is not drawn.
+    pub content_title_rect: Option<Rect>,
     /// The content pane's in-pane scrollbar tracks (1-cell rects), present only when drawn.
     pub content_vbar: Option<Rect>,
     pub content_hbar: Option<Rect>,
@@ -1339,10 +1437,17 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
 
     // Content: the SAME block `draw_content` builds (border + optional left gap), then the notices
     // split and bar layout it computes — so a click maps against the padded interior actually drawn.
+    // The title lives on the top border of the *column* rect (before `inner`), not the text rect.
+    let content_title_rect = content.map(|r| Rect {
+        x: r.x.saturating_add(1),
+        y: r.y,
+        width: r.width.saturating_sub(2),
+        height: 1,
+    });
     let (content_inner, content_vbar, content_hbar) =
         match content.map(|r| content_block(state).inner(r)) {
             Some(ci) => {
-                let (_notices, content_area) = content_notice_split(ci, state.notices.len());
+                let (_notices, content_area) = content_notice_split(ci, notice_strip_len(state));
                 let (text, v, h) = content_bars(
                     content_area,
                     state.content_rows as usize,
@@ -1399,6 +1504,7 @@ pub fn geometry(area: Rect, state: &ViewState) -> PaneGeometry {
         tree_vbar,
         tree_hbar,
         content_inner,
+        content_title_rect,
         content_vbar,
         content_hbar,
         divider_x,

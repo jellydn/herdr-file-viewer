@@ -31,17 +31,24 @@ that directory (on Linux it is
 `~/.config/herdr/plugins/config/herdr-file-viewer/`, so the file is that path plus `config.toml`).
 Run standalone (outside herdr), it
 falls back to `$XDG_CONFIG_HOME/herdr-file-viewer/config.toml`, defaulting to
-`~/.config/herdr-file-viewer/config.toml` when `XDG_CONFIG_HOME` isn't set. A missing file is the
-normal case — every key falls back to its default.
+`~/.config/herdr-file-viewer/config.toml` when `XDG_CONFIG_HOME` isn't set. On **Windows**, where
+neither `XDG_CONFIG_HOME` nor `HOME` is set, that resolves to
+`%USERPROFILE%\.config\herdr-file-viewer\config.toml`. A missing file is the normal case — every key
+falls back to its default.
+
+Print the herdr-managed directory at any time with `herdr plugin config-dir herdr-file-viewer`. The
+path has to resolve to an **absolute** location: a config file is trusted input (it can set the
+`editor` command), so a path that would resolve relative to the working directory is refused rather
+than sourced from whatever repository you happen to have open.
 
 ## Precedence
 
 A config key always wins. Only two keys also have an environment-variable fallback tier below the
 config key and above the built-in default — `editor` (`$EDITOR`) and `update_check`
 (`$HERDR_FILE_VIEWER_NO_UPDATE_CHECK`) — giving those two a `config > env > default` chain. Every
-other key (`markdown`, `diff`, `syntax`, `open`, `reveal`, `hide_dotfiles`, `confirm_discard`,
-`scroll_lines`, `tree_width`, `tree_position`, `tree_max_cols`, `preview_max_lines`,
-`preview_max_kib`) has no
+other key (`markdown`, `diff`, `syntax`, `open`, `reveal`, `hide_dotfiles`, `show_ignored`,
+`compact_dirs`, `confirm_discard`, `scroll_lines`, `tree_width`, `tree_position`, `tree_max_cols`,
+`preview_max_lines`, `preview_max_kib`) has no
 applicable environment variable; for those it's `config > default` only.
 
 ## Keys
@@ -59,6 +66,8 @@ open = "xdg-open"           # override the `O` open-with / `R` reveal-in-file-ma
 reveal = "nautilus"
 
 hide_dotfiles = false       # true to hide dotfiles at startup (the `.` key still toggles)
+show_ignored = false        # true to show gitignored files at startup (the `i` key still toggles)
+compact_dirs = false        # true to draw a chain of single-child dirs as ONE row (src/main/java)
 update_check = true         # false to disable the once-a-day update check
 confirm_discard = true      # false to discard annotations without confirming (on quit / worktree switch)
 scroll_lines = 3            # mouse-wheel step (content/search/help), a 1 to 10 scale: 1 slow · 3 medium · 6 fast · 10 max
@@ -92,6 +101,26 @@ either to view bigger files (`preview_max_lines` up to `100000`, `preview_max_ki
 One caveat for **diffs**: a diff is additionally bounded at ~4 MB by the git-capture step, independent
 of `preview_max_kib`. So raising `preview_max_kib` above ~4 MB widens how much *file content* is shown
 but not how much of a very large *diff* is (a diff past that bound is shown up to ~4 MB).
+
+`compact_dirs` changes the tree's **shape**, not what it shows. With it on, a chain of directories
+that each hold nothing but one subdirectory is drawn as a single row — `src/main/java/br/com` instead
+of six rows, each indented two columns further than the last. The row leads into the deepest
+directory of the chain, so expanding, collapsing, status colors, and the changed-file jump all act on
+that one. A chain stops the moment a directory holds a file or a second entry, and it follows what
+the tree is currently *showing*: a directory whose other entries are gitignored (or hidden, under
+`.`) folds like the single-child directory it appears to be.
+
+It is off by default because the trade depends on the repo. On a deep Java/Maven or nested monorepo
+layout — where the per-segment tree spends most of a narrow column on indentation and truncates the
+file names that matter — it wins outright. On a shallow repo it mostly costs you the 1:1 "one row is
+one directory" reading of the tree. Turn it on if your paths are deeper than your pane is wide.
+
+One small behavior difference: deciding whether a row folds means peeking inside directories the
+tree has not opened, so a compacted tree remembers which directories fold instead of re-checking
+every frame. Listings themselves are still read live — a new file appears as immediately as it
+always did — but the *span* of a folded row can lag. If a file created outside the viewer is what
+ends a chain, the row keeps its old span until the viewer re-checks, which it does on launch, `r`,
+returning from the editor, switching baseline, and regaining focus.
 
 `confirm_discard` guards the one piece of state the viewer can lose. Annotations (`a` / `A`) are
 session-only, so both quitting (`q`) and switching worktree (`W`) discard them. By default either
@@ -141,6 +170,8 @@ customized).
 | --- | --- | --- | --- |
 | **Navigation** | `nav_up` | `Up`, `k` | Move the tree cursor up one row |
 | | `nav_down` | `Down`, `j` | Move the tree cursor down one row |
+| | `page_up` | `PageUp` | Move up one screenful (content pane when focused, else the tree cursor) |
+| | `page_down` | `PageDown`, `Space` | Move down one screenful (content pane when focused, else the tree cursor) |
 | | `expand` | `Right`, `l` | Expand the selected directory |
 | | `collapse` | `Left`, `h` | Collapse the selected directory |
 | | `activate` | `Enter` | Activate the selection: expand/collapse a directory, or open a file |
@@ -158,6 +189,7 @@ customized).
 | | `toggle_changed_only` | `c` | Restrict the tree to changed files (baseline-aware), or restore the full tree |
 | | `toggle_status_mode` | `d` | Toggle git-status mode: filter to current working-tree status and show working-tree diffs |
 | | `toggle_baseline` | `b` | Switch the diff baseline between base-branch and `HEAD` |
+| | `cycle_diff_render` | `D` | Cycle diff presentation — delta unified → side-by-side → plain `git diff` (side-by-side applies when the configured diff renderer is Delta) |
 | | `refresh` | `r` | Re-read git state and re-render |
 | **Open & copy** | `open_in_editor` | `e` | Hand the selected file off to an external editor |
 | | `open_with_app` | `O` | Open the selected entry with the OS default application |
@@ -171,6 +203,8 @@ customized).
 | | `open_search` | `/` | Open the in-file search prompt |
 | | `next_match` | `n` | Jump to the next search match (wraps) |
 | | `prev_match` | `N` | Jump to the previous search match (wraps) |
+| | `next_changed` | `]` | Jump the tree cursor to the next changed file (wraps) |
+| | `prev_changed` | `[` | Jump the tree cursor to the previous changed file (wraps) |
 | **Session** | `dismiss_update` | `u` | Dismiss the update-available banner for this session |
 | | `switch_worktree` | `W` | Open the worktree picker to re-root at another git worktree |
 | | `show_help` | `?` | Open the in-app help overlay (What's New and About) |

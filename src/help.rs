@@ -269,6 +269,8 @@ pub fn settings_text(
          open              = {open}\n\
          reveal            = {reveal}\n\
          hide_dotfiles     = {hide_dotfiles}\n\
+         show_ignored      = {show_ignored}\n\
+         compact_dirs      = {compact_dirs}\n\
          update_check      = {update_check}\n\
          confirm_discard   = {confirm_discard}\n\
          scroll_lines      = {scroll_lines}\n\
@@ -280,6 +282,8 @@ pub fn settings_text(
         open = open,
         reveal = reveal,
         hide_dotfiles = eff.hide_dotfiles,
+        show_ignored = eff.show_ignored,
+        compact_dirs = eff.compact_dirs,
         update_check = update_check,
         confirm_discard = confirm_discard,
         scroll_lines = eff.scroll_lines,
@@ -774,6 +778,8 @@ mod tests {
             open: None,
             reveal: None,
             hide_dotfiles: true,
+            show_ignored: true,
+            compact_dirs: true,
             update_check: false,
             confirm_discard: false,
             scroll_lines: 7,
@@ -811,6 +817,8 @@ mod tests {
             "open",
             "reveal",
             "hide_dotfiles",
+            "show_ignored",
+            "compact_dirs",
             "update_check",
             "scroll_lines",
             "tree_width",
@@ -876,6 +884,8 @@ mod tests {
             "open              = xdg-open",
             "reveal            = xdg-open",
             "hide_dotfiles     = true",
+            "show_ignored      = true",
+            "compact_dirs      = true",
             "update_check      = off",
             "scroll_lines      = 7",
         ] {
@@ -952,6 +962,8 @@ mod tests {
         );
         for row in [
             "hide_dotfiles     = false",
+            "show_ignored      = false",
+            "compact_dirs      = false",
             "update_check      = on",
             "confirm_discard   = on",
             &format!(

@@ -86,6 +86,37 @@ const HSCROLL_STEP: u16 = 8;
 /// would let a wedged `glow` freeze input for up to 5s. On timeout the existing render path falls
 /// back to plain text + a notice (AC-15). This reconciles prerender-at-open with AC-22.
 const HELP_RENDER_TIMEOUT: Duration = Duration::from_millis(250);
+/// How long a [`Flash`] stays at full brightness before it starts to dim.
+const FLASH_FULL: Duration = Duration::from_millis(1600);
+/// How long a [`Flash`] lingers dimmed after [`FLASH_FULL`] before it disappears entirely. The
+/// bright→dim→gone progression is the terminal-idiomatic "fade" for an auto-dismissing hint.
+const FLASH_DIM: Duration = Duration::from_millis(700);
+/// How long a launch open-target **range** keeps a passive content highlight (option 3). Display
+/// only: no line-select modal, no key capture. Cleared early on content change or Esc.
+const OPEN_RANGE_FLASH: Duration = Duration::from_secs(1);
+
+/// A self-expiring, one-line status hint (e.g. "Diff: side-by-side" after `D`). Unlike
+/// [`Controller::action_notice`] — which persists until the next intent because a failure message
+/// must not vanish on its own — a flash fades on a timer: full brightness for [`FLASH_FULL`], then
+/// dimmed for [`FLASH_DIM`], then removed. The event loop advances it via
+/// [`Controller::tick_flash`].
+struct Flash {
+    text: String,
+    /// When the flash switches from full brightness to dimmed.
+    dim_at: Instant,
+    /// When the flash disappears entirely.
+    deadline: Instant,
+    /// The phase currently reflected on screen, so [`Controller::tick_flash`] only asks for a
+    /// redraw on a real transition (full→dim, or →gone) rather than every idle tick.
+    dim: bool,
+}
+
+/// Inclusive 1-based source-line range to highlight passively after a launch open target.
+struct OpenRangeFlash {
+    start: usize,
+    end: usize,
+    deadline: Instant,
+}
 /// The help overlay's self-operating key-hints footer (AC-11) — at minimum how to switch sections
 /// and how to close. Carried in `HelpView` so the Presenter stays mode-agnostic; matches the keys
 /// `handle_help_key` actually handles (Tab/←→ switch · digits/1-9 also; Esc/q/`?` close).
@@ -108,6 +139,40 @@ pub trait GitService: Send + Sync {
     /// `baseline`. Empty `rel_dir` means the whole tree root. Used by git-status mode (`d`)
     /// when a directory is selected.
     fn diff_directory(&self, rel_dir: &Path, baseline: Baseline) -> String;
+}
+
+/// Which command the Diff/FullDiff views delegate to. Cycled by `D`:
+/// `Delta` → `DeltaSideBySide` → `Raw` → `Delta`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffRenderMode {
+    /// The configured `delta` renderer, unified (delta's default layout).
+    #[default]
+    Delta,
+    /// The configured `delta` renderer with `--side-by-side` appended — old/new shown in two
+    /// columns instead of interleaved.
+    DeltaSideBySide,
+    /// A plain, unstyled `git diff` passthrough — bypasses `delta` entirely.
+    Raw,
+}
+
+impl DiffRenderMode {
+    /// The next mode in the cycle (wraps at the end).
+    pub fn next(self) -> Self {
+        match self {
+            DiffRenderMode::Delta => DiffRenderMode::DeltaSideBySide,
+            DiffRenderMode::DeltaSideBySide => DiffRenderMode::Raw,
+            DiffRenderMode::Raw => DiffRenderMode::Delta,
+        }
+    }
+
+    /// A short human label for the flash hint shown when `D` cycles to this mode.
+    pub fn label(self) -> &'static str {
+        match self {
+            DiffRenderMode::Delta => "Diff: unified",
+            DiffRenderMode::DeltaSideBySide => "Diff: side-by-side",
+            DiffRenderMode::Raw => "Diff: raw (plain git diff)",
+        }
+    }
 }
 
 /// The rendered content pane for one file: ingested text plus any non-fatal notices
@@ -138,14 +203,28 @@ pub trait ContentProvider: Send {
     /// width into glow's `-w`.
     ///
     /// [`render`]: ContentProvider::render
+    ///
+    /// `diff_render_mode` picks which command the Diff/FullDiff modes delegate to — `delta`
+    /// unified, `delta --side-by-side`, or a plain `git diff` passthrough (`D` cycles it).
+    /// Ignored by every other mode.
+    ///
+    /// `pane_width` is the pane's drawable width whenever it's known. It is passed to delta's
+    /// `--width` because the renderer is piped rather than attached to a terminal. Ignored by
+    /// every mode except Diff/FullDiff.
+    ///
+    /// `width` remains the markdown wrap width (gated by the markdown wrap preference).
     fn render_at_width(
         &self,
         path: &Path,
         mode: ViewMode,
         raw_diff: Option<&str>,
         width: Option<u16>,
+        pane_width: Option<u16>,
+        diff_render_mode: DiffRenderMode,
     ) -> RenderResult {
         let _ = width;
+        let _ = pane_width;
+        let _ = diff_render_mode;
         self.render(path, mode, raw_diff)
     }
 }
@@ -284,6 +363,16 @@ struct RenderJob {
     /// delegate uses it: glow lays out and wraps tables to this width so they fit the pane
     /// instead of overflowing and being shattered by the Presenter's re-wrap.
     wrap_width: Option<u16>,
+    /// The content pane's drawable text width, unconditional — unlike `wrap_width` it is NOT
+    /// gated by the markdown wrap preference (`effective_wrap`), because
+    /// it feeds `delta`'s own `--width` rather than a line-wrap decision. `delta` is spawned
+    /// with stdout piped (not a real tty), so it cannot auto-detect a terminal width itself and
+    /// falls back to a fixed default, which visibly clips `DiffRenderMode::DeltaSideBySide`'s
+    /// two columns regardless of the actual pane size. `None` before the first draw has
+    /// measured the pane. Ignored by every mode except Diff/FullDiff.
+    pane_width: Option<u16>,
+    /// Which command a Diff/FullDiff render delegates to (`D`). Ignored by other modes.
+    diff_render_mode: DiffRenderMode,
 }
 
 /// A re-root's off-thread git result: the working-tree status (tree markers, AC-7) and the
@@ -453,7 +542,16 @@ pub struct Controller {
     /// `confirm_discard`, default `true`). When `false`, `q` quits and discards, which
     /// is the pre-confirm behavior.
     confirm_discard: bool,
+    /// Whether a chain of single-child directories is drawn as one row (config `compact_dirs`,
+    /// default `false`). A session preference carried across a re-root (like `show_ignored` /
+    /// `hide_hidden`), so the new root's fresh tree is rebuilt with the same shape.
+    compact_dirs: bool,
     changed_only: bool,
+    /// Which command a Diff/FullDiff render delegates to (`D`, cycling Delta →
+    /// DeltaSideBySide → Raw). Carried
+    /// across a re-root like the other display preferences (`show_ignored`, `hide_hidden`,
+    /// `changed_only`, `baseline`).
+    diff_render_mode: DiffRenderMode,
     /// Sticky git-status mode (`d`): tree filtered to current working-tree status and content
     /// forced to working-tree diffs (file or directory-scoped). Mutually exclusive with
     /// [`Self::changed_only`] (baseline-aware `c`). Cleared only by a second `d` (or by
@@ -559,6 +657,9 @@ pub struct Controller {
     /// A transient notice from the last action (e.g. an editor-launch failure); shown until
     /// the next intent is handled.
     action_notice: Option<String>,
+    /// A self-expiring status hint (`D`'s diff-presentation label). Fades on a timer rather than
+    /// on the next intent — see [`Flash`].
+    flash: Option<Flash>,
     /// Session-only annotations, bound to the current root and never persisted.
     annotations: AnnotationStore,
     git: Arc<dyn GitService>,
@@ -586,8 +687,10 @@ pub struct Controller {
     /// Hit-test geometry from the last drawn frame (fed back by the Presenter), so a mouse
     /// event can be mapped to a tree row / the content pane / the divider.
     geom: PaneGeometry,
-    /// The previous left-click `(col, row, time)`, for double-click detection.
-    last_click: Option<(u16, u16, Instant)>,
+    /// The previous left-click `(col, row, time, origin)`, for double-click detection.
+    /// `origin` is a [`ClickOrigin`] so tree / title / finder pairs cannot cross-match on the same
+    /// screen row (same-row matching is intentional within one origin for touchpad column jitter).
+    last_click: Option<(u16, u16, Instant, ClickOrigin)>,
     /// What the held left button is dragging (divider resize or a scrollbar), so the release is
     /// treated as the end of the drag, not a click. `None` ⇒ no drag in progress.
     drag: Option<Drag>,
@@ -648,6 +751,15 @@ pub struct Controller {
     /// it is queued against the dispatched render's seq and applied by [`poll`] (AC-7). `None` when no
     /// jump is pending; superseded (cleared) by any newer render dispatch.
     pending_goto: Option<(u64, usize)>,
+    /// After a successful launch **open target**, zoom on the first layout that reports a hidden
+    /// content column (`content_width == 0`, the narrow tree-only layout). Cleared on the first
+    /// [`set_content_viewport`](Self::set_content_viewport) either way so a wide pane is not forced
+    /// into zoom. At apply time no frame has been drawn yet, so content_width is always 0 then and
+    /// cannot be used as the signal directly (that would always zoom).
+    pending_open_zoom: bool,
+    /// Passive range highlight after a launch open target of the form `path:start-end`. Soft
+    /// content highlight only (no modal); expires at `deadline` or earlier on content change / Esc.
+    open_range_flash: Option<OpenRangeFlash>,
     /// A queued line-select entry awaiting its source re-render: the render seq to wait for. Set when
     /// `L` enters line-select in a **transformed** view (RenderedMarkdown / Diff / FullDiff) or while a
     /// source render is still in flight — the file is switched to the source-mapped content view and the
@@ -740,8 +852,10 @@ impl Controller {
             hide_hidden: false,
             // Defaults ON, matching the resolver: a Controller built without config still guards.
             confirm_discard: true,
+            compact_dirs: false,
             tree_hscroll: 0,
             changed_only: false,
+            diff_render_mode: DiffRenderMode::default(),
             status_mode: false,
             git_status: BTreeMap::new(),
             focus: Focus::Tree,
@@ -766,6 +880,7 @@ impl Controller {
             content_path: None,
             content_rendering: false,
             action_notice: None,
+            flash: None,
             annotations: AnnotationStore::new(),
             git,
             editor,
@@ -788,6 +903,8 @@ impl Controller {
             status_rx: None,
             modal: Modal::None,
             pending_goto: None,
+            pending_open_zoom: false,
+            open_range_flash: None,
             pending_line_select: None,
             applied_seq: 0,
             search: None,
@@ -854,6 +971,8 @@ impl Controller {
                         job.mode,
                         raw_diff.as_deref(),
                         job.wrap_width,
+                        job.pane_width,
+                        job.diff_render_mode,
                     )
                 }))
                 .unwrap_or_else(|_| RenderResult {
@@ -944,6 +1063,7 @@ impl Controller {
         self.root = resolved.root.clone();
         self.is_git_repo = resolved.is_git_repo;
         self.tree = TreeModel::new(resolved.root.clone());
+        self.tree.set_compact_dirs(self.compact_dirs); // a carried session preference (AC-12)
         // Recompute the cached branch for the new root's bottom-border title. Cheap and
         // synchronous: a single `git rev-parse` against the already-resolved repo root, done once
         // per re-root (not per-frame). `None` when the new root is outside a repo / detached.
@@ -977,6 +1097,9 @@ impl Controller {
         });
         self.changed = BTreeMap::new();
         self.git_status = BTreeMap::new();
+        // The diff-presentation flash is bound to the file it was raised over; drop it so a stale
+        // hint can't linger over the freshly re-rooted tree.
+        self.flash = None;
         // Close whatever modal is open (one assignment, since `modal` is now a single value). A
         // re-root only fires via picker-confirm, so in practice it's the picker being torn down —
         // but a re-root also invalidates the finder's old-root candidate list and must not strand a
@@ -1088,6 +1211,43 @@ impl Controller {
     /// to inspect it directly (e.g. the re-root failure guard, AC-16).
     pub fn action_notice(&self) -> Option<&str> {
         self.action_notice.as_deref()
+    }
+
+    /// Show a self-expiring status hint. It fades on its own (see [`Flash`]); unlike
+    /// [`action_notice`](Self::action_notice) it survives an idle screen but is replaced whenever
+    /// a newer flash is set.
+    fn set_flash(&mut self, text: impl Into<String>) {
+        let now = Instant::now();
+        self.flash = Some(Flash {
+            text: text.into(),
+            dim_at: now + FLASH_FULL,
+            deadline: now + FLASH_FULL + FLASH_DIM,
+            dim: false,
+        });
+    }
+
+    /// Advance the flash clock to `now`, expiring or dimming it as time passes. Returns `true`
+    /// only when the visible state changed (dim transition or removal) so the event loop redraws
+    /// exactly once per transition, never on every idle tick. Called from the run loop each tick.
+    pub fn tick_flash(&mut self, now: Instant) -> bool {
+        let Some(f) = self.flash.as_mut() else {
+            return false;
+        };
+        if now >= f.deadline {
+            self.flash = None;
+            return true;
+        }
+        let should_dim = now >= f.dim_at;
+        if should_dim != f.dim {
+            f.dim = should_dim;
+            return true;
+        }
+        false
+    }
+
+    /// The active flash's text, if any. Exposed for tests.
+    pub fn flash_text(&self) -> Option<&str> {
+        self.flash.as_ref().map(|f| f.text.as_str())
     }
 
     /// The open worktree picker's state, or `None` when it is closed. Exposed so the Presenter
@@ -1226,9 +1386,118 @@ impl Controller {
         self.dispatch_render();
     }
 
+    /// Apply the startup show-ignored default from config (issue #119). Called once by `app::run`
+    /// right after construction, before the first draw. Mirrors `apply_hide_dotfiles`'s two-field
+    /// update (the controller's own `show_ignored` mirror plus the tree's filter) so the later
+    /// interactive `i` toggle reads a value already in sync with what it's revealing, rather than
+    /// re-applying (or silently undoing) the configured default on the very first press. `.git/`
+    /// is unaffected either way -- the tree never browses into it regardless of this filter.
+    pub fn apply_show_ignored(&mut self, show: bool) {
+        if show == self.show_ignored {
+            // No change from the current (startup) state -- `Controller::new`'s initial render
+            // already reflects it, so re-rendering would be redundant. This is the common
+            // no-config case, where `show` is the default `false`.
+            return;
+        }
+        self.show_ignored = show;
+        self.tree.set_show_ignored(show);
+        // Revealing ignored entries can shift which node the cursor lands on, so re-render the
+        // content pane for the (possibly) new selection -- mirrors `toggle_ignore`'s own
+        // post-filter re-render, and `apply_hide_dotfiles`'s same reasoning.
+        self.dispatch_render();
+    }
+
     /// Apply the config-driven `confirm_discard` switch. Pure in-memory wiring.
     pub fn apply_confirm_discard(&mut self, confirm: bool) {
         self.confirm_discard = confirm;
+    }
+
+    /// Apply the config-driven `compact_dirs` tree shape: draw a chain of single-child directories
+    /// as one row. Called once by `app::run` right after construction, before the first draw, and
+    /// re-applied on a re-root (the tree is rebuilt, but this is a session preference). Compaction
+    /// changes only how rows are grouped and labelled — never which files the tree shows — so
+    /// unlike `apply_hide_dotfiles` it cannot move the selection onto a different file and needs no
+    /// re-render.
+    pub fn apply_compact_dirs(&mut self, on: bool) {
+        self.compact_dirs = on;
+        self.tree.set_compact_dirs(on);
+    }
+
+    /// Apply a launch **open target** once at startup: resolve `path` under the tree **root**,
+    /// **reveal in tree**, dispatch a render, and (when a line is set) queue a **go to line** via
+    /// [`pending_goto`](Self::pending_goto) after forcing the source-mapped view when needed.
+    ///
+    /// Soft failures only: a path outside the root, or a missing / non-file path, sets a non-fatal
+    /// [`action_notice`](Self::action_notice) and leaves the selection unchanged (AC-N5, AC-20).
+    ///
+    /// Narrow-pane zoom is deferred: on success sets [`pending_open_zoom`](Self::pending_open_zoom)
+    /// so the first [`set_content_viewport`](Self::set_content_viewport) zooms only when the
+    /// content column is actually hidden (tree-only layout), matching the file finder's confirm
+    /// path without always zooming on a wide first paint.
+    pub fn apply_open_target(&mut self, target: &crate::open_target::OpenTarget) {
+        let Some(abs) = crate::open_target::resolve_under_root(&self.root, &target.path) else {
+            self.action_notice = Some(format!("Could not open {}: outside tree root", target.path));
+            return;
+        };
+        if !self.tree.reveal(&abs) {
+            self.action_notice = Some(format!("Could not open {}", target.path));
+            return;
+        }
+        // reveal() may have relaxed changed_only / hide_hidden / show_ignored — re-sync controller
+        // mirrors (same as the file finder's confirm path, plus show_ignored for launch targets).
+        self.resync_filter_mirrors();
+        // Defer zoom until the first real layout measurement (see `set_content_viewport`).
+        self.pending_open_zoom = true;
+        // Success notice (option 2): echo the open target as a line reference. Cleared on the
+        // next intent, same as other action notices.
+        self.action_notice = Some(format!("Opened {}", target.display_ref()));
+
+        if let Some(line) = target.goto_line() {
+            // Mirror `:` confirm: a transformed view (diff / rendered md) has no 1:1 source row,
+            // so force SyntaxContent and queue the jump for when that render lands.
+            if self.selected_view_mode() != Some(ViewMode::SyntaxContent)
+                && let Some(path) = self
+                    .tree
+                    .selected()
+                    .filter(|n| n.kind == NodeKind::File)
+                    .map(|n| n.path.clone())
+            {
+                self.overrides.insert(path, ViewMode::SyntaxContent);
+            }
+            self.dispatch_render();
+            self.pending_goto = Some((self.latest_seq, line));
+        } else {
+            self.dispatch_render();
+        }
+        // Option 3: after dispatch (which clears prior flash), arm a passive range highlight for
+        // `path:start-end` only — display-only, auto-expires, no line-select modal.
+        if let (Some(a), Some(b)) = (target.line, target.end_line) {
+            let (start, end) = if a <= b { (a, b) } else { (b, a) };
+            self.open_range_flash = Some(OpenRangeFlash {
+                start,
+                end,
+                deadline: Instant::now() + OPEN_RANGE_FLASH,
+            });
+        }
+    }
+
+    /// Advance the launch open-range highlight clock. Returns `true` when the highlight expired
+    /// so the event loop redraws once.
+    pub fn tick_open_range_flash(&mut self, now: Instant) -> bool {
+        let Some(f) = &self.open_range_flash else {
+            return false;
+        };
+        if now >= f.deadline {
+            self.open_range_flash = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Inclusive range of the active passive open-range flash, if any. Exposed for tests.
+    pub fn open_range_flash_lines(&self) -> Option<(usize, usize)> {
+        self.open_range_flash.as_ref().map(|f| (f.start, f.end))
     }
 
     /// Set the mouse-wheel **scroll step** from the effective config (`scroll_lines`). Called once
@@ -1271,9 +1540,26 @@ impl Controller {
 
     /// Record the content viewport `(width, height)` the Presenter last drew into, so content
     /// scrolling can be clamped to it. Called by the run loop after each draw.
-    pub fn set_content_viewport(&mut self, width: u16, height: u16) {
+    ///
+    /// Returns `true` when the run loop should redraw immediately: a deferred launch-open zoom
+    /// just activated because this frame's content column was hidden (`width == 0`). The current
+    /// frame already painted tree-only; the next paint shows the zoomed file.
+    pub fn set_content_viewport(&mut self, width: u16, height: u16) -> bool {
+        // Launch open target (narrow pane): first real measurement decides zoom. Must run even
+        // when width/height are unchanged from the initial (0, 0), otherwise a tree-only first
+        // frame would never trigger the zoom.
+        let mut need_redraw = false;
+        if self.pending_open_zoom {
+            self.pending_open_zoom = false;
+            if width == 0 {
+                // Same as finder confirm / tree Enter on a file when content is not visible.
+                self.zoomed = true;
+                self.focus = Focus::Content;
+                need_redraw = true;
+            }
+        }
         if width == self.content_width && height == self.content_height {
-            return; // unchanged — avoid recomputing the clamp on every (mostly idle) draw
+            return need_redraw; // unchanged — avoid recomputing the clamp on every idle draw
         }
         let width_changed = width != self.content_width;
         self.content_width = width;
@@ -1282,14 +1568,14 @@ impl Controller {
         // the end, leaving blank space; re-clamp both axes to the new geometry.
         self.content_scroll = self.content_scroll.min(self.max_content_scroll());
         self.content_hscroll = self.content_hscroll.min(self.max_content_hscroll());
-        // When markdown is fit-to-pane (wrapped), glow lays the table out to the pane width, so a
-        // width change (terminal resize or split-bar drag) must reflow it, preserving scroll and
-        // search (unlike a selection-change render). When unwrapped (the `w` horizontal-scroll view)
-        // glow's natural-width output is width-independent — the pane just re-clamps h-scroll, no
-        // re-render. A height-only change never affects glow's layout either.
-        if width_changed && self.effective_wrap() {
-            self.rerender_markdown_reflow();
+        // A width-sensitive delegate (glow fit-to-pane markdown, or a non-`Raw` delta diff mode)
+        // must reflow to the new width, preserving scroll and search (unlike a selection-change
+        // render); `rerender_after_resize` gates per-mode whether that applies. A height-only
+        // change never affects either delegate's layout.
+        if width_changed {
+            self.rerender_after_resize();
         }
+        need_redraw
     }
 
     /// Receive the hit-test geometry the Presenter drew this frame (fed back from the draw
@@ -1365,6 +1651,10 @@ impl Controller {
             selected,
             content: self.content.clone(),
             notices: self.notices(),
+            flash: self.flash.as_ref().map(|f| crate::presenter::FlashLine {
+                text: f.text.clone(),
+                dim: f.dim,
+            }),
             focus: self.focus,
             width: self.width,
             content_scroll: self.content_scroll,
@@ -1421,31 +1711,44 @@ impl Controller {
                 current: s.current,
             }),
             // Populate the line-select overlay from the active modal so the Presenter draws the
-            // marker + selection highlight (AC-1, AC-7). `None` when the modal is closed → the
-            // content path is byte-identical to the prior render (no other snapshot moves).
-            line_select: self.modal.line_select().map(|s| {
-                let (start, end) = s.selection();
-                // A mouse drag carries character carets → the overlay highlights just those chars;
-                // a keyboard selection has none → the whole-line highlight.
-                let char_sel = if s.is_char_mode() {
-                    let ((sl, sc), (el, ec)) = s.char_span();
-                    Some(CharSelView {
-                        start_line: sl,
-                        start_col: sc,
-                        end_line: el,
-                        end_col: ec,
-                        gutter: sel_gutter,
+            // marker + selection highlight (AC-1, AC-7). When the modal is closed, a launch
+            // open-range flash (if any) reuses the same view slot as a *passive* highlight only.
+            line_select: self
+                .modal
+                .line_select()
+                .map(|s| {
+                    let (start, end) = s.selection();
+                    // A mouse drag carries character carets → the overlay highlights just those chars;
+                    // a keyboard selection has none → the whole-line highlight.
+                    let char_sel = if s.is_char_mode() {
+                        let ((sl, sc), (el, ec)) = s.char_span();
+                        Some(CharSelView {
+                            start_line: sl,
+                            start_col: sc,
+                            end_line: el,
+                            end_col: ec,
+                            gutter: sel_gutter,
+                        })
+                    } else {
+                        None
+                    };
+                    LineSelectView {
+                        marker: s.marker(),
+                        start,
+                        end,
+                        char_sel,
+                        passive: false,
+                    }
+                })
+                .or_else(|| {
+                    self.open_range_flash.as_ref().map(|f| LineSelectView {
+                        marker: f.start,
+                        start: f.start,
+                        end: f.end,
+                        char_sel: None,
+                        passive: true,
                     })
-                } else {
-                    None
-                };
-                LineSelectView {
-                    marker: s.marker(),
-                    start,
-                    end,
-                    char_sel,
-                }
-            }),
+                }),
             // Snapshot the ambient selection only when non-collapsed, so a bare click never paints a
             // zero-width highlight (`draw_content` gives `line_select` precedence if both were set).
             content_selection: self
@@ -1587,6 +1890,10 @@ impl Controller {
         match intent {
             Intent::NavUp => self.navigate(-1),
             Intent::NavDown => self.navigate(1),
+            // One screenful, measured from the focused pane's live height so it follows a resize.
+            // navigate() already routes by focus and scroll_content() clamps to [0, max].
+            Intent::PageUp => self.navigate(-self.page_step()),
+            Intent::PageDown => self.navigate(self.page_step()),
             Intent::Expand => self.expand(),
             Intent::Collapse => self.collapse(),
             Intent::Activate => self.activate(),
@@ -1596,6 +1903,7 @@ impl Controller {
             Intent::ToggleChangedOnly => self.toggle_changed_only(),
             Intent::ToggleStatusMode => self.toggle_status_mode(),
             Intent::ToggleBaseline => self.toggle_baseline(),
+            Intent::CycleDiffRender => self.cycle_diff_render(),
             Intent::CycleView => self.cycle_view(),
             Intent::OpenInEditor => self.open_in_editor(),
             Intent::OpenWithApp => self.open_with_app(),
@@ -1617,6 +1925,8 @@ impl Controller {
             Intent::OpenSearch => self.open_search(),
             Intent::NextMatch => self.next_match(),
             Intent::PrevMatch => self.prev_match(),
+            Intent::NextChanged => self.navigate_changed(true),
+            Intent::PrevChanged => self.navigate_changed(false),
             Intent::TreeScrollLeft => self.scroll_tree_h_focus(-(HSCROLL_STEP as i32)),
             // `L` is focus-gated (ADR-0010, copy-line-reference): on tree focus it is unchanged
             // (AC-2, still `scroll_tree_h_focus`); on content focus it instead enters line-select
@@ -1644,6 +1954,20 @@ impl Controller {
         }
     }
 
+    /// One screenful of movement, in rows: the drawn height of the pane [`navigate`](Self::navigate)
+    /// will move, so each pane pages by its own viewport. The panes differ in height, and in the
+    /// narrow (< 80 column) layout only the focused one is drawn at all — the content viewport
+    /// stays `(0, 0)` for as long as the tree holds focus there, so paging by `content_height`
+    /// would step the tree cursor a single row per press. Falls back to one row while the focused
+    /// pane has no measured geometry (before the first layout pass), so a page key is never a no-op.
+    fn page_step(&self) -> isize {
+        let rows = match self.focus {
+            Focus::Content => self.content_height,
+            Focus::Tree => self.geom.tree_inner.map_or(0, |inner| inner.height),
+        };
+        (rows as isize).max(1)
+    }
+
     /// Up/down navigation is focus-aware: it moves the tree cursor when the tree is focused
     /// (selecting a file, which re-renders the content), and scrolls the content pane when the
     /// content is focused (`Tab` switches focus). This reads each pane's natural keys without
@@ -1660,6 +1984,65 @@ impl Controller {
                 Effects::redraw()
             }
         }
+    }
+
+    /// Jump the tree cursor to the next / previous **changed file** (`]` / `[`), wrapping at the
+    /// ends with a notice — the tree-level counterpart to `n`/`N` over search matches. Reviewing a
+    /// branch is a walk over the changed files, and in a deep tree that walk costs a lot of `j`
+    /// presses through directory rows; this makes it one key.
+    ///
+    /// The set walked is the one the tree is filtered by: the working-tree status while status
+    /// mode (`d`) is on, else the baseline-aware changed-set that `c` and `b` drive. Focus-blind
+    /// on purpose — it moves the *tree*, so it works while reading the content pane too. Inert
+    /// without git (AC-26) or with nothing changed, which gets a notice rather than silence so the
+    /// key never looks broken — as does a set whose every file the current filters hide, since the
+    /// jump skips those rather than unfiltering the tree to reach them. Selecting re-renders, so
+    /// the jump lands on the file's diff.
+    fn navigate_changed(&mut self, forward: bool) -> Effects {
+        if !self.is_git_repo {
+            return Effects::noop(); // inert without git (AC-26)
+        }
+        // Borrowing two disjoint fields: `tree` mutably, the changed-set immutably.
+        let set = if self.status_mode {
+            &self.git_status
+        } else {
+            &self.changed
+        };
+        let Some(wrapped) = self.tree.select_changed(forward, set) else {
+            self.action_notice = Some("No changed files".into());
+            return Effects::redraw();
+        };
+        // No filter-mirror re-sync here, unlike the finder confirm and the launch open target:
+        // `select_changed` expands ancestors but never relaxes a filter, so the mirrors cannot go
+        // stale. A candidate the current filters hide is skipped instead of forced into view.
+        if wrapped {
+            self.action_notice = Some(if forward {
+                "Changed files: wrapped to the first".into()
+            } else {
+                "Changed files: wrapped to the last".into()
+            });
+        }
+        self.dispatch_render(); // new selection → re-render (and reset the scroll)
+        Effects::redraw()
+    }
+
+    /// Re-sync the controller's filter mirrors (`changed_only`, `status_mode`, `hide_hidden`,
+    /// `show_ignored`) from the tree after a [`TreeModel::reveal`], which relaxes a filter that
+    /// would otherwise hide the revealed target. Without this a later `c` / `.` / `i` / `d` toggle
+    /// would flip against a stale mirror and appear to do nothing.
+    ///
+    /// Status mode and baseline-aware changed-only share the tree's single `changed_only` flag, so
+    /// a relaxed filter must clear both mirrors; while status mode is on it owns the flag, which
+    /// leaves `changed_only` false.
+    pub(super) fn resync_filter_mirrors(&mut self) {
+        if self.tree.changed_only() {
+            self.changed_only = !self.status_mode;
+        } else {
+            self.changed_only = false;
+            self.status_mode = false;
+        }
+        self.hide_hidden = self.tree.hide_hidden();
+        self.show_ignored = self.tree.show_ignored();
     }
 
     /// Scroll the content pane by `delta` lines, clamped to `[0, max]` so it can never run
@@ -1983,6 +2366,25 @@ impl Controller {
         Effects::redraw()
     }
 
+    /// Cycle the Diff/FullDiff renderer (`delta` unified → side-by-side → raw git diff).
+    /// The key is inert outside a diff view so it cannot reset unrelated content scroll/search.
+    fn cycle_diff_render(&mut self) -> Effects {
+        let Some(node) = self.tree.selected() else {
+            return Effects::noop();
+        };
+        if node.kind != NodeKind::File {
+            return Effects::noop();
+        }
+        let mode = self.effective_mode(&node.path);
+        if !matches!(mode, ViewMode::Diff | ViewMode::FullDiff) {
+            return Effects::noop();
+        }
+        self.diff_render_mode = self.diff_render_mode.next();
+        self.set_flash(self.diff_render_mode.label());
+        self.dispatch_render();
+        Effects::redraw()
+    }
+
     fn cycle_view(&mut self) -> Effects {
         let Some(node) = self.tree.selected() else {
             return Effects::noop();
@@ -2173,6 +2575,10 @@ impl Controller {
         if self.content_selection.take().is_some() {
             return Effects::redraw();
         }
+        // Same layer: dismiss a launch open-range flash without quitting.
+        if self.open_range_flash.take().is_some() {
+            return Effects::redraw();
+        }
         // A committed search (prompt closed, highlights persisting) is dismissed first — Esc/q
         // "come out of the search" before they unzoom or close (layered like unzoom). (owner UX)
         if self.search.is_some() && !self.prompt_open() {
@@ -2352,7 +2758,7 @@ impl Controller {
         self.content_hscroll = self.content_hscroll.min(self.max_content_hscroll());
         // Markdown must re-render at the new wrap width (fit vs. natural); a no-op for other modes,
         // which only need the re-clamp above.
-        self.rerender_markdown_reflow();
+        self.rerender_after_wrap_toggle();
         Effects::redraw()
     }
 
@@ -2491,40 +2897,91 @@ impl Controller {
         (self.content_width > 0 && self.effective_wrap()).then_some(self.content_width)
     }
 
-    /// Re-render the current markdown selection **without** the view-state reset [`dispatch_render`]
-    /// performs — the triggers are a content-pane resize and the `w` wrap toggle, neither of which is
-    /// a selection change, so scroll position and any active search must survive. Only rendered
-    /// markdown is re-rendered: glow's layout is tied to the wrap width we pass it (fit-to-pane vs.
-    /// natural width), so a resize-while-fit or a wrap toggle must re-run glow; every other mode is
-    /// width-independent here (diffs/code re-wrap in the Presenter alone), so this is a no-op for
-    /// them. The current content stays on screen until the new render lands (no `Rendering…`
-    /// placeholder), so a live split-drag doesn't flash; the worker collapses the backlog so only the
-    /// final state renders. [`poll`] applies the result by `seq` and, seeing it flagged in
-    /// `reflow_seq`, keeps the scroll and recomputes an active search.
-    fn rerender_markdown_reflow(&mut self) {
+    /// The content pane's drawable text width, unconditional (unlike
+    /// [`md_wrap_width`](Self::md_wrap_width), which is gated by the markdown wrap
+    /// preference) — feeds `delta`'s own `--width` for the diff modes. `None` before the
+    /// first draw has measured the pane.
+    fn pane_width(&self) -> Option<u16> {
+        (self.content_width > 0).then_some(self.content_width)
+    }
+
+    /// `w` wrap toggle: re-render if the selection is rendered markdown, since wrap changes
+    /// glow's `-w` (fit-to-pane vs. natural width). No-op for every other mode — wrap is pure
+    /// Presenter layout there (diffs/code re-wrap in the Presenter alone; `delta`'s own output
+    /// is width-, not wrap-, sensitive — see [`rerender_after_resize`](Self::rerender_after_resize)).
+    fn rerender_after_wrap_toggle(&mut self) {
         let Some(node) = self.tree.selected() else {
             return;
         };
-        if node.kind != NodeKind::File
-            || self.effective_mode(&node.path) != ViewMode::RenderedMarkdown
+        if node.kind == NodeKind::File
+            && self.effective_mode(&node.path) == ViewMode::RenderedMarkdown
         {
+            self.dispatch_reflow(node.path, ViewMode::RenderedMarkdown);
+        }
+    }
+
+    /// Content-pane resize (a terminal resize or a split-bar drag): re-render if the selection
+    /// delegates to something width-sensitive — rendered markdown when fit-to-pane (glow lays
+    /// the table out to the pane width), or a Diff/FullDiff view whose `delta` mode isn't `Raw`
+    /// (`delta` is piped, not a real tty, so it can't auto-detect a terminal width itself and a
+    /// `DeltaSideBySide` render otherwise stays sized to its stale fallback width after a
+    /// resize — `Raw` is `cat`, unaffected by width either way). Every other case is
+    /// width-independent here and a no-op.
+    fn rerender_after_resize(&mut self) {
+        let Some(node) = self.tree.selected() else {
+            return;
+        };
+        if node.kind != NodeKind::File {
             return;
         }
+        let mode = self.effective_mode(&node.path);
+        let reflow = match mode {
+            ViewMode::RenderedMarkdown => self.effective_wrap(),
+            ViewMode::Diff | ViewMode::FullDiff => self.diff_render_mode != DiffRenderMode::Raw,
+            ViewMode::SyntaxContent => false,
+        };
+        if reflow {
+            self.dispatch_reflow(node.path, mode);
+        }
+    }
+
+    /// Re-render `path` at `mode` **without** the view-state reset [`dispatch_render`] performs
+    /// — shared core for [`rerender_after_wrap_toggle`](Self::rerender_after_wrap_toggle) and
+    /// [`rerender_after_resize`](Self::rerender_after_resize), neither of which is a selection
+    /// change, so scroll position and any active search must survive. The current content stays
+    /// on screen until the new render lands (no `Rendering…` placeholder), so a live split-drag
+    /// doesn't flash; the worker collapses the backlog so only the final state renders. [`poll`]
+    /// applies the result by `seq` and, seeing it flagged in `reflow_seq`, keeps the scroll and
+    /// recomputes an active search.
+    fn dispatch_reflow(&mut self, path: PathBuf, mode: ViewMode) {
         self.latest_seq += 1;
         let seq = self.latest_seq;
         self.reflow_seq = Some(seq);
-        let rel = self.rel(&node.path);
+        let rel = self.rel(&path);
+        // Status mode always diffs the working tree, so a reflow must use the SAME forced
+        // `Baseline::Head` `dispatch_render` does — otherwise a resize/wrap re-render on a
+        // feature branch (where `self.baseline` is `Base`) would silently flip a status-mode diff
+        // from the working tree to the merge-base. `dispatch_reflow` only fires for a selected
+        // FILE (rerender_after_resize/_wrap_toggle both return early for a directory), so the
+        // directory-scoped diff never routes here — `directory_diff` stays false.
+        let baseline = if self.status_mode && self.is_git_repo {
+            Baseline::Head
+        } else {
+            self.baseline
+        };
         // Ignore a send error: if the worker is gone the current content simply stays; `poll` will
         // never receive a result for this seq, which is fine (nothing was cleared).
         let _ = self.job_tx.send(RenderJob {
             seq,
-            path: node.path,
+            path,
             rel,
-            mode: ViewMode::RenderedMarkdown,
-            baseline: self.baseline,
+            mode,
+            baseline,
             is_git: self.is_git_repo,
             directory_diff: false,
             wrap_width: self.md_wrap_width(),
+            pane_width: self.pane_width(),
+            diff_render_mode: self.diff_render_mode,
         });
     }
 
@@ -2559,6 +3016,9 @@ impl Controller {
         // something against the body it was dragged over, so a stale highlight (and copy) must not
         // carry onto new content. Scrolling keeps it — it doesn't dispatch, and the coords stay valid.
         self.content_selection = None;
+        // Launch open-range flash is also content-bound: a new file/view must not keep the old
+        // range painted. (apply_open_target re-arms it after its own dispatch.)
+        self.open_range_flash = None;
 
         let Some(node) = self.tree.selected() else {
             // No visible node: an empty tree or a filter (changed-only, gitignore, etc.)
@@ -2606,6 +3066,8 @@ impl Controller {
                 is_git: self.is_git_repo,
                 directory_diff,
                 wrap_width: self.md_wrap_width(),
+                pane_width: self.pane_width(),
+                diff_render_mode: self.diff_render_mode,
             })
             .is_ok()
         {
@@ -2801,11 +3263,25 @@ enum PathKind {
     Absolute,
 }
 
+/// Which interactive surface produced a pending left-click, for double-click pairing.
+/// Stored with [`Controller::last_click`] so same-row matching cannot cross contexts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClickOrigin {
+    /// A tree row (expand/collapse or open-in-zoom).
+    Tree,
+    /// The content column title bar (toggle zoom, GH #106).
+    ContentTitle,
+    /// A finder result row (confirm).
+    Finder,
+}
+
 /// Where a mouse cell falls in the drawn layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MouseRegion {
     TreeRow(usize),
     Content,
+    /// The content column's top-border title (filename). Double-click toggles zoom (#106).
+    ContentTitle,
     Divider,
     /// The content pane's vertical scrollbar — drag up/down to scroll.
     ContentVBar,
@@ -2912,6 +3388,19 @@ mod tests {
         }
     }
 
+    /// Content stub with many source-mapped lines so go-to-line / open-target scroll is observable.
+    struct MultilineContent;
+    impl ContentProvider for MultilineContent {
+        fn render(&self, _path: &Path, _mode: ViewMode, _raw_diff: Option<&str>) -> RenderResult {
+            let body: String = (1..=40).map(|i| format!("body line {i}\n")).collect();
+            RenderResult {
+                content: Text::raw(body),
+                notices: Vec::new(),
+                source: Some((1..=40).map(|i| format!("body line {i}")).collect()),
+            }
+        }
+    }
+
     struct StubEditor;
     impl EditorHandoff for StubEditor {
         fn open(&mut self, _file: &Path) -> EditorOutcome {
@@ -2953,6 +3442,465 @@ mod tests {
             renderers: None,
         };
         Controller::new(resolved, Baseline::Head, components)
+    }
+
+    #[test]
+    fn page_step_is_the_focused_pane_viewport_and_never_zero() {
+        // A page is the drawn height of the pane the key will actually move, so paging follows a
+        // resize instead of using a fixed stride — and the tree keeps paging by tree rows even in
+        // the narrow layout, where the undrawn content column reports a (0, 0) viewport. The floor
+        // of 1 covers a key pressed before the first layout pass, when neither pane is measured.
+        let mut ctrl = wiring_controller();
+        assert_eq!(
+            ctrl.page_step(),
+            1,
+            "nothing measured yet → still move a row"
+        );
+
+        ctrl.set_content_viewport(80, 20);
+        assert_eq!(
+            ctrl.page_step(),
+            1,
+            "tree focused, no tree drawn yet → a row"
+        );
+        ctrl.set_pane_geometry(PaneGeometry {
+            tree_inner: Some(ratatui::layout::Rect {
+                x: 1,
+                y: 1,
+                width: 30,
+                height: 12,
+            }),
+            ..PaneGeometry::default()
+        });
+        assert_eq!(ctrl.page_step(), 12, "a page is the tree's own height");
+
+        ctrl.focus = Focus::Content;
+        assert_eq!(
+            ctrl.page_step(),
+            20,
+            "content focus pages by the content pane"
+        );
+        ctrl.set_content_viewport(80, 7);
+        assert_eq!(ctrl.page_step(), 7, "and it tracks a resize");
+    }
+
+    struct ChangedGit {
+        path: PathBuf,
+    }
+
+    impl GitService for ChangedGit {
+        fn status(&self) -> BTreeMap<PathBuf, Status> {
+            BTreeMap::from([(self.path.clone(), Status::Modified)])
+        }
+
+        fn changed_set(&self, _baseline: Baseline) -> BTreeMap<PathBuf, Status> {
+            self.status()
+        }
+
+        fn diff(&self, _rel: &Path, _baseline: Baseline, _full: bool) -> String {
+            "- old\n+ new\n".into()
+        }
+
+        fn diff_directory(&self, _rel_dir: &Path, _baseline: Baseline) -> String {
+            "- old\n+ new\n".into()
+        }
+    }
+
+    fn diff_cycle_controller(is_git_repo: bool) -> Controller {
+        let root = std::env::temp_dir().join(format!(
+            "hfv-diff-cycle-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let path = PathBuf::from("sample.rs");
+        std::fs::write(root.join(&path), "fn sample() {}\n").unwrap();
+        let git: Arc<dyn GitService> = if is_git_repo {
+            Arc::new(ChangedGit { path })
+        } else {
+            Arc::new(StubGit)
+        };
+        let resolved = Resolved {
+            repo_root: is_git_repo.then(|| root.clone()),
+            root,
+            is_git_repo,
+            is_worktree: false,
+            base_branch: None,
+        };
+        let components = Components {
+            providers: Box::new(move |_r: &Resolved| RootProviders {
+                git: Arc::clone(&git),
+                content: Box::new(StubContent),
+            }),
+            editor: Box::new(StubEditor),
+            clipboard: Box::new(StubClipboard),
+            renderers: None,
+        };
+        Controller::new(resolved, Baseline::Head, components)
+    }
+
+    /// Controller over a temp tree with `src/deep/file.rs` for open-target apply tests.
+    fn open_target_controller() -> (Controller, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "hfv-open-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(root.join("src/deep"));
+        std::fs::write(root.join("src/deep/file.rs"), "line1\nline2\nline3\n").unwrap();
+        std::fs::write(root.join("other.rs"), "x\n").unwrap();
+        let resolved = Resolved {
+            repo_root: None,
+            root: root.clone(),
+            is_git_repo: false,
+            is_worktree: false,
+            base_branch: None,
+        };
+        let git: Arc<dyn GitService> = Arc::new(StubGit);
+        let components = Components {
+            providers: Box::new(move |_r: &Resolved| RootProviders {
+                git: Arc::clone(&git),
+                content: Box::new(StubContent),
+            }),
+            editor: Box::new(StubEditor),
+            clipboard: Box::new(StubClipboard),
+            renderers: None,
+        };
+        (Controller::new(resolved, Baseline::Head, components), root)
+    }
+
+    #[test]
+    fn apply_open_target_reveals_file() {
+        let (mut ctrl, root) = open_target_controller();
+        let target = crate::open_target::OpenTarget {
+            path: "src/deep/file.rs".into(),
+            line: None,
+            end_line: None,
+        };
+        ctrl.apply_open_target(&target);
+        let selected = ctrl.tree.selected().expect("selected after open");
+        assert_eq!(selected.path, root.join("src/deep/file.rs"));
+        assert_eq!(ctrl.action_notice(), Some("Opened src/deep/file.rs"));
+        assert!(ctrl.pending_goto_line().is_none());
+    }
+
+    #[test]
+    fn apply_open_target_queues_goto_line() {
+        let (mut ctrl, root) = open_target_controller();
+        let target = crate::open_target::OpenTarget {
+            path: "src/deep/file.rs".into(),
+            line: Some(3),
+            end_line: None,
+        };
+        ctrl.apply_open_target(&target);
+        let selected = ctrl.tree.selected().expect("selected after open");
+        assert_eq!(selected.path, root.join("src/deep/file.rs"));
+        assert_eq!(ctrl.pending_goto_line(), Some(3));
+        assert_eq!(ctrl.action_notice(), Some("Opened src/deep/file.rs:3"));
+    }
+
+    #[test]
+    fn apply_open_target_range_notice_and_jumps_to_start() {
+        let (mut ctrl, root) = open_target_controller();
+        let target = crate::open_target::OpenTarget {
+            path: "src/deep/file.rs".into(),
+            line: Some(1),
+            end_line: Some(3),
+        };
+        ctrl.apply_open_target(&target);
+        let selected = ctrl.tree.selected().expect("selected after open");
+        assert_eq!(selected.path, root.join("src/deep/file.rs"));
+        assert_eq!(ctrl.pending_goto_line(), Some(1));
+        assert_eq!(ctrl.action_notice(), Some("Opened src/deep/file.rs:1-3"));
+        assert_eq!(ctrl.open_range_flash_lines(), Some((1, 3)));
+        // Passive highlight appears in view_state (not a modal).
+        let vs = ctrl.view_state();
+        let ls = vs.line_select.expect("passive range flash in view");
+        assert!(ls.passive);
+        assert_eq!((ls.start, ls.end), (1, 3));
+        assert!(
+            ctrl.modal.line_select().is_none(),
+            "must not enter line-select modal"
+        );
+    }
+
+    #[test]
+    fn apply_open_target_range_flash_expires() {
+        let (mut ctrl, _root) = open_target_controller();
+        let target = crate::open_target::OpenTarget {
+            path: "src/deep/file.rs".into(),
+            line: Some(1),
+            end_line: Some(2),
+        };
+        ctrl.apply_open_target(&target);
+        assert!(ctrl.open_range_flash_lines().is_some());
+        let now = Instant::now();
+        assert!(!ctrl.tick_open_range_flash(now));
+        assert!(ctrl.tick_open_range_flash(now + OPEN_RANGE_FLASH + Duration::from_millis(1)));
+        assert!(ctrl.open_range_flash_lines().is_none());
+    }
+
+    #[test]
+    fn apply_open_target_single_line_has_no_range_flash() {
+        let (mut ctrl, _root) = open_target_controller();
+        let target = crate::open_target::OpenTarget {
+            path: "src/deep/file.rs".into(),
+            line: Some(2),
+            end_line: None,
+        };
+        ctrl.apply_open_target(&target);
+        assert!(ctrl.open_range_flash_lines().is_none());
+    }
+
+    /// Open-target with `:line` must queue goto and, after the render lands, scroll past the top.
+    #[test]
+    fn apply_open_target_line_scrolls_after_poll() {
+        let root = std::env::temp_dir().join(format!(
+            "hfv-open-scroll-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        std::fs::write(root.join("long.rs"), "x\n".repeat(40)).unwrap();
+        let resolved = Resolved {
+            repo_root: None,
+            root: root.clone(),
+            is_git_repo: false,
+            is_worktree: false,
+            base_branch: None,
+        };
+        let git: Arc<dyn GitService> = Arc::new(StubGit);
+        let components = Components {
+            providers: Box::new(move |_r: &Resolved| RootProviders {
+                git: Arc::clone(&git),
+                content: Box::new(MultilineContent),
+            }),
+            editor: Box::new(StubEditor),
+            clipboard: Box::new(StubClipboard),
+            renderers: None,
+        };
+        let mut ctrl = Controller::new(resolved, Baseline::Head, components);
+        // Viewport shorter than the file so a mid-file jump produces non-zero scroll.
+        let _ = ctrl.set_content_viewport(80, 10);
+        let target = crate::open_target::OpenTarget {
+            path: "long.rs".into(),
+            line: Some(20),
+            end_line: None,
+        };
+        ctrl.apply_open_target(&target);
+        assert_eq!(ctrl.pending_goto_line(), Some(20));
+        // Drain the worker until the queued jump applies.
+        let mut saw = false;
+        for _ in 0..50 {
+            if ctrl.poll().is_some() && ctrl.pending_goto_line().is_none() {
+                saw = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(saw, "render+goto should land");
+        assert!(
+            ctrl.content_scroll() > 0,
+            "line 20 must scroll past the top; scroll={}",
+            ctrl.content_scroll()
+        );
+    }
+
+    #[test]
+    fn apply_open_target_resyncs_show_ignored_mirror() {
+        let root = std::env::temp_dir().join(format!(
+            "hfv-open-ign-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let _ = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status();
+        std::fs::write(root.join(".gitignore"), "secret.log\n").unwrap();
+        std::fs::write(root.join("secret.log"), "s\n").unwrap();
+        std::fs::write(root.join("ok.rs"), "ok\n").unwrap();
+        let resolved = Resolved {
+            repo_root: None,
+            root: root.clone(),
+            is_git_repo: false,
+            is_worktree: false,
+            base_branch: None,
+        };
+        let git: Arc<dyn GitService> = Arc::new(StubGit);
+        let components = Components {
+            providers: Box::new(move |_r: &Resolved| RootProviders {
+                git: Arc::clone(&git),
+                content: Box::new(StubContent),
+            }),
+            editor: Box::new(StubEditor),
+            clipboard: Box::new(StubClipboard),
+            renderers: None,
+        };
+        let mut ctrl = Controller::new(resolved, Baseline::Head, components);
+        assert!(!ctrl.show_ignored());
+        ctrl.apply_open_target(&crate::open_target::OpenTarget {
+            path: "secret.log".into(),
+            line: None,
+            end_line: None,
+        });
+        assert!(ctrl.show_ignored(), "mirror must match tree after reveal");
+        assert_eq!(
+            ctrl.tree.selected().map(|n| n
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()),
+            Some("secret.log".into())
+        );
+    }
+
+    #[test]
+    fn apply_open_target_missing_file_is_soft_notice() {
+        let (mut ctrl, _root) = open_target_controller();
+        let before = ctrl.tree.selected().map(|n| n.path.clone());
+        let target = crate::open_target::OpenTarget {
+            path: "no/such.rs".into(),
+            line: Some(1),
+            end_line: None,
+        };
+        ctrl.apply_open_target(&target);
+        assert_eq!(ctrl.tree.selected().map(|n| n.path.clone()), before);
+        assert!(
+            ctrl.action_notice()
+                .is_some_and(|n| n.contains("Could not open")),
+            "expected soft notice, got {:?}",
+            ctrl.action_notice()
+        );
+        assert!(ctrl.pending_goto_line().is_none());
+    }
+
+    #[test]
+    fn apply_open_target_outside_root_is_soft_notice() {
+        let (mut ctrl, _root) = open_target_controller();
+        let target = crate::open_target::OpenTarget {
+            path: "/tmp/escape.rs".into(),
+            line: None,
+            end_line: None,
+        };
+        ctrl.apply_open_target(&target);
+        assert!(
+            ctrl.action_notice()
+                .is_some_and(|n| n.contains("outside tree root")),
+            "expected outside-root notice, got {:?}",
+            ctrl.action_notice()
+        );
+    }
+
+    #[test]
+    fn apply_open_target_zooms_when_first_layout_hides_content() {
+        let (mut ctrl, _root) = open_target_controller();
+        let target = crate::open_target::OpenTarget {
+            path: "src/deep/file.rs".into(),
+            line: Some(2),
+            end_line: None,
+        };
+        ctrl.apply_open_target(&target);
+        assert!(!ctrl.zoomed(), "must not zoom before first layout measure");
+        // Narrow / tree-only first frame: content column width 0 → zoom so the file is visible.
+        assert!(ctrl.set_content_viewport(0, 24));
+        assert!(ctrl.zoomed());
+        assert_eq!(ctrl.focus(), Focus::Content);
+    }
+
+    #[test]
+    fn apply_open_target_does_not_zoom_when_content_column_visible() {
+        let (mut ctrl, _root) = open_target_controller();
+        let target = crate::open_target::OpenTarget {
+            path: "src/deep/file.rs".into(),
+            line: None,
+            end_line: None,
+        };
+        ctrl.apply_open_target(&target);
+        // Wide two-column first frame: leave layout alone.
+        assert!(!ctrl.set_content_viewport(60, 24));
+        assert!(!ctrl.zoomed());
+    }
+
+    #[test]
+    fn diff_render_mode_cycles_three_states() {
+        let mut ctrl = diff_cycle_controller(true);
+        assert_eq!(
+            ctrl.effective_mode(&ctrl.tree.selected().unwrap().path),
+            ViewMode::Diff
+        );
+        assert_eq!(ctrl.diff_render_mode, DiffRenderMode::Delta);
+
+        ctrl.handle(Intent::CycleDiffRender);
+        assert_eq!(ctrl.diff_render_mode, DiffRenderMode::DeltaSideBySide);
+        ctrl.handle(Intent::CycleDiffRender);
+        assert_eq!(ctrl.diff_render_mode, DiffRenderMode::Raw);
+        ctrl.handle(Intent::CycleDiffRender);
+        assert_eq!(ctrl.diff_render_mode, DiffRenderMode::Delta);
+    }
+
+    #[test]
+    fn diff_render_cycle_is_inert_outside_diff_views() {
+        let mut ctrl = diff_cycle_controller(false);
+        assert_eq!(
+            ctrl.effective_mode(&ctrl.tree.selected().unwrap().path),
+            ViewMode::SyntaxContent
+        );
+        let seq = ctrl.latest_seq;
+        ctrl.handle(Intent::CycleDiffRender);
+        assert_eq!(ctrl.diff_render_mode, DiffRenderMode::Delta);
+        assert_eq!(ctrl.latest_seq, seq);
+    }
+
+    #[test]
+    fn diff_resize_dispatches_a_reflow_job() {
+        let mut ctrl = diff_cycle_controller(true);
+        let seq = ctrl.latest_seq;
+        ctrl.set_content_viewport(80, 20);
+        assert!(
+            ctrl.latest_seq > seq,
+            "a measured diff pane resize must re-render delta"
+        );
+    }
+
+    #[test]
+    fn cycling_diff_render_flashes_the_new_mode_label() {
+        let mut ctrl = diff_cycle_controller(true);
+        assert_eq!(ctrl.flash_text(), None, "no flash before any cycle");
+        ctrl.handle(Intent::CycleDiffRender);
+        assert_eq!(ctrl.flash_text(), Some("Diff: side-by-side"));
+        ctrl.handle(Intent::CycleDiffRender);
+        assert_eq!(ctrl.flash_text(), Some("Diff: raw (plain git diff)"));
+    }
+
+    #[test]
+    fn inert_diff_cycle_shows_no_flash() {
+        // Outside a diff view the key is a no-op, so it must not flash either.
+        let mut ctrl = diff_cycle_controller(false);
+        ctrl.handle(Intent::CycleDiffRender);
+        assert_eq!(ctrl.flash_text(), None);
+    }
+
+    #[test]
+    fn flash_dims_then_expires_over_time() {
+        let mut ctrl = diff_cycle_controller(true);
+        ctrl.handle(Intent::CycleDiffRender);
+        let start = Instant::now();
+        // Still fully shown right away: no phase change, no redraw requested.
+        assert!(!ctrl.tick_flash(start));
+        assert_eq!(ctrl.flash_text(), Some("Diff: side-by-side"));
+        // Into the dim window: one redraw for the full→dim transition, none on a repeat tick.
+        let dim = start + FLASH_FULL + Duration::from_millis(1);
+        assert!(ctrl.tick_flash(dim), "full→dim transition redraws once");
+        assert!(!ctrl.tick_flash(dim), "same phase does not redraw again");
+        assert!(ctrl.flash_text().is_some(), "still visible while dimmed");
+        // Past the deadline: one redraw as it disappears, then nothing left.
+        let gone = start + FLASH_FULL + FLASH_DIM + Duration::from_millis(1);
+        assert!(ctrl.tick_flash(gone), "expiry redraws once");
+        assert_eq!(ctrl.flash_text(), None);
+        assert!(!ctrl.tick_flash(gone), "nothing left to expire");
     }
 
     #[test]
@@ -3054,6 +4002,73 @@ mod tests {
         assert!(
             body.contains("Re-read git state"),
             "the appended Keybindings section body must carry the registry descriptions, got: {body}"
+        );
+    }
+
+    // ---- AltGr closes an already-open help overlay on Windows (matches opening) ----------
+
+    #[test]
+    fn normalized_altgr_question_mark_closes_open_help_overlay() {
+        let mut ctrl = wiring_controller();
+        ctrl.open_help();
+        let altgr = crate::input::normalize_altgr(
+            KeyEvent::new(
+                KeyCode::Char('?'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            true,
+        );
+
+        ctrl.handle_help_key(altgr);
+
+        assert!(ctrl.help_state().is_none());
+    }
+
+    /// Ctrl+Alt(+Shift)+`?` while help is open: on Windows this must close the overlay, exactly
+    /// mirroring how it opens one via `Intent::ShowHelp` (AC parity, no drift between open/close).
+    #[test]
+    #[cfg(windows)]
+    fn altgr_question_mark_closes_open_help_overlay_on_windows() {
+        let mut ctrl = wiring_controller();
+        ctrl.open_help();
+        assert!(
+            ctrl.help_state().is_some(),
+            "help must be open before the AltGr key"
+        );
+
+        let altgr_close = KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        ctrl.handle_help_key(altgr_close);
+
+        assert!(
+            ctrl.help_state().is_none(),
+            "AltGr+? must close the open help overlay on Windows"
+        );
+    }
+
+    /// Off Windows the same chord is a genuine Ctrl+Alt chord, not AltGr typing, so it must stay
+    /// inert and leave the overlay open (consumed no-op, nothing leaks past the modal).
+    #[test]
+    #[cfg(not(windows))]
+    fn ctrl_alt_question_mark_leaves_help_overlay_open_off_windows() {
+        let mut ctrl = wiring_controller();
+        ctrl.open_help();
+        assert!(
+            ctrl.help_state().is_some(),
+            "help must be open before the chord"
+        );
+
+        let ctrl_alt = KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        ctrl.handle_help_key(ctrl_alt);
+
+        assert!(
+            ctrl.help_state().is_some(),
+            "off Windows, Ctrl+Alt+? must not close the help overlay"
         );
     }
 }

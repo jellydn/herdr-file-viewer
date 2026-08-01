@@ -333,6 +333,75 @@ fn apply_hide_dotfiles_at_startup_re_renders_so_content_matches_the_new_selectio
 }
 
 #[test]
+fn apply_show_ignored_sets_the_tree_startup_default_and_mirrors_the_toggle_state() {
+    // Issue #119 (Settings Applier): a config-driven startup default for the `i` show-ignored
+    // filter -- applied once after construction, distinct from the interactive ToggleIgnore
+    // intent. Both the tree's own filter and the controller's `show_ignored()` mirror (what the
+    // later `i` toggle reads/flips) must reflect it.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join(".gitignore"), "secret.log\n").unwrap();
+    std::fs::write(dir.path().join("secret.log"), "s").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    assert!(
+        !ctrl.tree().show_ignored(),
+        "off by default before applying"
+    );
+    assert!(!ctrl.show_ignored(), "controller mirror off by default too");
+    assert!(
+        !visible_names(&ctrl).contains(&"secret.log".to_string()),
+        "ignored file hidden before applying"
+    );
+
+    ctrl.apply_show_ignored(true);
+    assert!(ctrl.tree().show_ignored(), "the tree's filter is now on");
+    assert!(ctrl.show_ignored(), "the controller's mirror is now on too");
+    assert!(
+        visible_names(&ctrl).contains(&"secret.log".to_string()),
+        "the ignored file is now shown, exactly as if `i` had been pressed once"
+    );
+
+    ctrl.apply_show_ignored(false);
+    assert!(
+        !ctrl.tree().show_ignored(),
+        "the tree's filter is off again"
+    );
+    assert!(
+        !ctrl.show_ignored(),
+        "the controller's mirror is off again too"
+    );
+}
+
+#[test]
+fn apply_show_ignored_true_then_the_first_interactive_toggle_flips_it_off() {
+    // Issue #119 end-to-end: a config default of `show_ignored = true` must survive startup and
+    // be flipped OFF (not back to true) by the very next interactive `i` press -- mirrors
+    // `apply_hide_dotfiles_true_then_the_first_interactive_toggle_flips_it_off`.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join(".gitignore"), "secret.log\n").unwrap();
+    std::fs::write(dir.path().join("secret.log"), "s").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    ctrl.apply_show_ignored(true);
+    assert!(ctrl.show_ignored(), "config default on at startup");
+    assert!(visible_names(&ctrl).contains(&"secret.log".to_string()));
+
+    ctrl.handle(Intent::ToggleIgnore);
+    assert!(
+        !ctrl.show_ignored(),
+        "the first `i` press flips the configured-on default OFF, not back to true"
+    );
+    assert!(
+        !visible_names(&ctrl).contains(&"secret.log".to_string()),
+        "the ignored file is hidden again after the toggle"
+    );
+
+    // `i` keeps toggling normally afterward.
+    ctrl.handle(Intent::ToggleIgnore);
+    assert!(ctrl.show_ignored(), "a further `i` press reveals it again");
+}
+
+#[test]
 fn toggle_changed_only_flips_in_a_repo() {
     // AC-6: restrict the tree to the changed-set, then restore the full tree.
     let dir = TempDir::new();
@@ -1267,6 +1336,112 @@ fn nav_scrolls_the_content_pane_when_focused_and_clamps_both_ends() {
 }
 
 #[test]
+fn page_keys_scroll_the_content_pane_by_one_viewport_and_clamp() {
+    // Space/PageDown/PageUp move a screenful of the pane they act on. With the content focused
+    // that is the content viewport — the tree is 20 rows here, so a step of 10 also shows the
+    // page is taken from the focused pane, not whichever pane happens to be taller.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let mut ctrl = controller_with_lines(dir.path(), 50);
+    await_marker(&mut ctrl, "L0");
+    ctrl.set_content_viewport(58, 10); // 50 lines, 10 visible → max scroll = 40
+    ctrl.set_pane_geometry(wide_geometry()); // tree interior: 20 rows
+
+    ctrl.handle(Intent::ToggleFocus);
+    assert_eq!(ctrl.focus(), Focus::Content);
+
+    ctrl.handle(Intent::PageDown);
+    assert_eq!(
+        ctrl.view_state().content_scroll,
+        10,
+        "PageDown advances one content viewport"
+    );
+    ctrl.handle(Intent::PageDown);
+    assert_eq!(ctrl.view_state().content_scroll, 20, "and another");
+    ctrl.handle(Intent::PageUp);
+    assert_eq!(
+        ctrl.view_state().content_scroll,
+        10,
+        "PageUp returns the same distance"
+    );
+
+    for _ in 0..5 {
+        ctrl.handle(Intent::PageUp);
+    }
+    assert_eq!(
+        ctrl.view_state().content_scroll,
+        0,
+        "cannot page above the first line"
+    );
+    for _ in 0..20 {
+        ctrl.handle(Intent::PageDown);
+    }
+    assert_eq!(
+        ctrl.view_state().content_scroll,
+        40,
+        "cannot page past the last screenful"
+    );
+}
+
+#[test]
+fn page_keys_move_the_tree_cursor_by_the_tree_height() {
+    // Tree focused: a page is the tree's own drawn height (20 rows), NOT the content pane's 10.
+    let dir = TempDir::new();
+    for i in 0..40 {
+        std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").unwrap();
+    }
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.set_content_viewport(58, 10);
+    ctrl.set_pane_geometry(wide_geometry()); // tree interior: 20 rows
+
+    assert_eq!(ctrl.focus(), Focus::Tree);
+    assert_eq!(ctrl.tree().cursor(), 0);
+    ctrl.handle(Intent::PageDown);
+    assert_eq!(ctrl.tree().cursor(), 20, "one screenful of tree rows down");
+    ctrl.handle(Intent::PageUp);
+    assert_eq!(ctrl.tree().cursor(), 0, "and back up");
+
+    for _ in 0..5 {
+        ctrl.handle(Intent::PageDown);
+    }
+    assert_eq!(ctrl.tree().cursor(), 39, "clamped at the last row");
+}
+
+#[test]
+fn narrow_layout_pages_the_tree_by_its_own_height_not_one_row() {
+    // Regression: under 80 columns the Presenter draws only the FOCUSED column, so while the tree
+    // holds focus the content viewport is fed back as (0, 0) on every frame — not just before the
+    // first one. Paging off the content height made PageDown a one-row step for as long as that
+    // layout held; the tree must still page by the rows it actually drew.
+    let dir = TempDir::new();
+    for i in 0..40 {
+        std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").unwrap();
+    }
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.set_content_viewport(0, 0); // tree-only frame: no content column was drawn
+    ctrl.set_pane_geometry(PaneGeometry {
+        area_x: 0,
+        area_width: 60,
+        tree_inner: Some(Rect {
+            x: 1,
+            y: 1,
+            width: 58,
+            height: 20,
+        }),
+        ..PaneGeometry::default()
+    });
+
+    ctrl.handle(Intent::PageDown);
+    assert_eq!(
+        ctrl.tree().cursor(),
+        20,
+        "a page stays a screenful of tree rows when the content column is not drawn"
+    );
+    ctrl.handle(Intent::PageUp);
+    assert_eq!(ctrl.tree().cursor(), 0, "and PageUp returns a full page");
+}
+
+#[test]
 fn scroll_to_line_brings_the_target_line_into_view_and_clamps_out_of_range() {
     let dir = TempDir::new();
     std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
@@ -1726,6 +1901,13 @@ fn wide_geometry() -> PaneGeometry {
             width: 58,
             height: 20,
         }),
+        // Top border of the content column (filename title); double-click toggles zoom (#106).
+        content_title_rect: Some(Rect {
+            x: 41,
+            y: 0,
+            width: 58,
+            height: 1,
+        }),
         content_vbar: None,
         content_hbar: None,
         divider_x: Some(40),
@@ -2151,6 +2333,80 @@ fn double_click_a_file_opens_it_in_zoom_mode_single_click_does_not() {
     assert!(
         opened.lock().unwrap().is_empty(),
         "double-clicking a file does NOT open the editor"
+    );
+}
+
+#[test]
+fn double_click_content_title_toggles_zoom() {
+    // GH #106: double-click the content pane title (filename border) toggles the tree on/off
+    // without needing `z`. Single-click only focuses content.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.set_pane_geometry(wide_geometry());
+    assert!(!ctrl.zoomed());
+
+    // Title bar is at y=0, x=41.. (see wide_geometry content_title_rect).
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 50, 0));
+    assert!(!ctrl.zoomed(), "single-click title does not zoom");
+    assert_eq!(ctrl.focus(), Focus::Content);
+
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 52, 0)); // double (same row)
+    assert!(ctrl.zoomed(), "double-click title zooms (hides tree)");
+    assert_eq!(ctrl.focus(), Focus::Content);
+
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 50, 0));
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 50, 0));
+    assert!(!ctrl.zoomed(), "double-click title again restores the tree");
+    assert_eq!(ctrl.focus(), Focus::Tree);
+}
+
+#[test]
+fn double_click_content_title_unzooms_with_real_zoomed_geometry() {
+    // The feature exists so the title is still hit-testable when zoomed (tree + divider gone).
+    // Build geometry from the real presenter path with `zoomed = true`, not a hand-rolled fixture.
+    use herdr_file_viewer::presenter;
+    use ratatui::layout::Rect;
+
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+
+    // Zoom first (as if the user opened a file full-width), then feed zoomed geometry.
+    ctrl.handle(Intent::ToggleZoom);
+    assert!(ctrl.zoomed());
+
+    let mut state = ctrl.view_state();
+    state.zoomed = true;
+    // Wide enough for a content column (zoomed = content full body).
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 24,
+    };
+    let geom = presenter::geometry(area, &state);
+    let title = geom
+        .content_title_rect
+        .expect("zoomed layout must expose a content title hit rect");
+    assert!(
+        title.width > 50 && title.height == 1,
+        "title should span most of the full-width content border: {title:?}"
+    );
+    assert!(
+        geom.tree_inner.is_none() && geom.divider_x.is_none(),
+        "zoomed geometry has no tree/divider"
+    );
+
+    ctrl.set_pane_geometry(geom);
+    // Double-click the title centre → unzoom.
+    let col = title.x + title.width / 2;
+    let row = title.y;
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
+    ctrl.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
+    assert!(
+        !ctrl.zoomed(),
+        "double-click title under zoomed geometry restores tree"
     );
 }
 
@@ -2987,13 +3243,64 @@ fn focus_gained_re_queries_git_but_preserves_content_scroll() {
 }
 
 #[test]
-fn focus_gained_without_a_repo_is_inert() {
-    // No repo → nothing to refresh (AC-26); focus-gain must not force a redraw or a git query.
+fn focus_gained_without_a_repo_queries_no_git_but_still_re_reads_the_tree() {
+    // No repo → no git query (AC-26). It is NOT inert beyond that, though: a directory outside a
+    // repo gains and loses files like any other, and focus-gain is the moment the viewer re-reads
+    // the world. It used to return before `refresh_git_state` altogether, which left a compacted
+    // tree's cached fold shapes stale until the user hit `r`.
     let dir = TempDir::new();
     std::fs::write(dir.path().join("a.txt"), "x").unwrap();
-    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    let git = StubGit::default();
+    let changed_calls = git.changed_calls.clone();
+    let (mut ctrl, _, _) = controller(dir.path(), false, git, false);
+
     let fx = ctrl.handle_focus_gained();
-    assert!(!fx.redraw && !fx.quit, "no repo → focus-gain is a no-op");
+    assert!(!fx.quit);
+    assert!(
+        changed_calls.lock().unwrap().is_empty(),
+        "AC-26: no repo, so no git is queried"
+    );
+}
+
+#[test]
+fn focus_gained_without_a_repo_un_stales_a_compacted_tree() {
+    // The regression the early return caused. With `compact_dirs` on, the tree caches which
+    // directories fold; in a non-git directory nothing ever dropped that cache, so a chain that
+    // stopped folding on disk kept rendering its old shape — and the file that ended it stayed
+    // invisible — until a manual `r`.
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("src/main/java")).unwrap();
+    std::fs::write(dir.path().join("src/main/java/App.java"), "x").unwrap();
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    ctrl.apply_compact_dirs(true);
+
+    let labels = |c: &Controller| -> Vec<String> {
+        c.tree()
+            .visible_nodes()
+            .iter()
+            .filter_map(|n| n.label.clone())
+            .collect()
+    };
+    assert_eq!(
+        labels(&ctrl),
+        vec!["src/main/java".to_string()],
+        "precondition: the whole chain folds into one row"
+    );
+
+    // A file added outside the viewer ends the chain two segments early.
+    std::fs::write(dir.path().join("src/main/Extra.java"), "x").unwrap();
+    assert_eq!(
+        labels(&ctrl),
+        vec!["src/main/java".to_string()],
+        "the cached shape has not noticed yet"
+    );
+
+    ctrl.handle_focus_gained();
+    assert_eq!(
+        labels(&ctrl),
+        vec!["src/main".to_string()],
+        "focus-gain re-probes even without a repo, so the new file's directory gets its row back"
+    );
 }
 
 /// A Git stub whose changed-set flips from `first` to `rest` after the first query — so a
@@ -9838,6 +10145,8 @@ fn open_help_appends_settings_section_when_display_is_set() {
         open: None,
         reveal: None,
         hide_dotfiles: false,
+        show_ignored: false,
+        compact_dirs: false,
         update_check: true,
         confirm_discard: true,
         scroll_lines: 3,
@@ -10287,4 +10596,200 @@ fn reveal_non_zero_exit_sets_a_non_fatal_notice() {
         "AC-8: reveal non-zero exit sets the reveal-specific notice, got: {notice:?}"
     );
     assert!(!fx.quit, "AC-8: a non-zero exit does not end the session");
+}
+
+#[test]
+fn apply_compact_dirs_folds_the_tree_and_survives_a_reroot() {
+    // The config path: `app::run` resolves `compact_dirs` and calls this. Tested here because the
+    // TreeModel tests set the flag directly and would not catch a broken wiring.
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("src/main/java")).unwrap();
+    std::fs::write(dir.path().join("src/main/java/App.java"), "x\n").unwrap();
+
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    assert!(
+        ctrl.tree()
+            .visible_nodes()
+            .iter()
+            .all(|n| n.label.is_none()),
+        "off by default"
+    );
+
+    ctrl.apply_compact_dirs(true);
+    let labels: Vec<String> = ctrl
+        .tree()
+        .visible_nodes()
+        .iter()
+        .filter_map(|n| n.label.clone())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["src/main/java".to_string()],
+        "the chain is folded into one labelled row"
+    );
+
+    // A re-root builds a fresh TreeModel; the preference must be carried onto it (AC-12).
+    let other = TempDir::new();
+    std::fs::create_dir_all(other.path().join("a/b/c")).unwrap();
+    std::fs::write(other.path().join("a/b/c/f.txt"), "x\n").unwrap();
+    ctrl.re_root(other.path());
+    let labels: Vec<String> = ctrl
+        .tree()
+        .visible_nodes()
+        .iter()
+        .filter_map(|n| n.label.clone())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["a/b/c".to_string()],
+        "compaction survives a worktree switch"
+    );
+}
+
+// ---- next / previous changed file (`]` / `[`) --------------------------------------------
+
+/// The file name the tree cursor sits on, or `""` with nothing selected.
+fn selected_name(ctrl: &Controller) -> String {
+    ctrl.tree()
+        .selected()
+        .map(|n| n.path.file_name().unwrap().to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+#[test]
+fn next_changed_walks_the_changed_set_and_notices_the_wrap() {
+    // `]` is the tree's `n`: step to the next changed file, wrapping with a notice so the key
+    // never looks dead at the end of the list.
+    let dir = TempDir::new();
+    for name in ["a.rs", "b.rs", "clean.rs"] {
+        std::fs::write(dir.path().join(name), "x\n").unwrap();
+    }
+    let mut changed = BTreeMap::new();
+    changed.insert(PathBuf::from("a.rs"), Status::Modified);
+    changed.insert(PathBuf::from("b.rs"), Status::Modified);
+    let git = StubGit {
+        changed,
+        ..Default::default()
+    };
+    let (mut ctrl, _, _) = controller(dir.path(), true, git, false);
+    assert_eq!(selected_name(&ctrl), "a.rs", "precondition");
+
+    let fx = ctrl.handle(Intent::NextChanged);
+    assert!(fx.redraw);
+    assert_eq!(selected_name(&ctrl), "b.rs", "] skips the clean file");
+    assert!(
+        ctrl.action_notice().is_none(),
+        "no wrap yet, so no notice: {:?}",
+        ctrl.action_notice()
+    );
+
+    ctrl.handle(Intent::NextChanged);
+    assert_eq!(selected_name(&ctrl), "a.rs", "] wraps to the first");
+    let notice = ctrl.action_notice().unwrap_or("");
+    assert!(
+        notice.contains("wrapped"),
+        "the wrap is surfaced, got: {notice:?}"
+    );
+}
+
+#[test]
+fn prev_changed_walks_backward_and_notices_the_wrap() {
+    let dir = TempDir::new();
+    for name in ["a.rs", "b.rs"] {
+        std::fs::write(dir.path().join(name), "x\n").unwrap();
+    }
+    let mut changed = BTreeMap::new();
+    changed.insert(PathBuf::from("a.rs"), Status::Modified);
+    changed.insert(PathBuf::from("b.rs"), Status::Modified);
+    let git = StubGit {
+        changed,
+        ..Default::default()
+    };
+    let (mut ctrl, _, _) = controller(dir.path(), true, git, false);
+    assert_eq!(selected_name(&ctrl), "a.rs", "precondition");
+
+    ctrl.handle(Intent::PrevChanged);
+    assert_eq!(selected_name(&ctrl), "b.rs", "[ wraps to the last");
+    assert!(
+        ctrl.action_notice().unwrap_or("").contains("wrapped"),
+        "the wrap is surfaced"
+    );
+
+    ctrl.handle(Intent::PrevChanged);
+    assert_eq!(selected_name(&ctrl), "a.rs");
+}
+
+#[test]
+fn changed_jump_uses_the_working_tree_status_while_status_mode_is_on() {
+    // `d` filters by working-tree status, so `]` must walk THAT set, not the baseline one —
+    // otherwise the jump would land on a file the filtered tree isn't even showing.
+    let dir = TempDir::new();
+    for name in ["base_only.rs", "status_only.rs"] {
+        std::fs::write(dir.path().join(name), "x\n").unwrap();
+    }
+    let mut status = BTreeMap::new();
+    status.insert(PathBuf::from("status_only.rs"), Status::Modified);
+    let mut changed = BTreeMap::new();
+    changed.insert(PathBuf::from("base_only.rs"), Status::Modified);
+    let git = StubGit {
+        status,
+        changed,
+        ..Default::default()
+    };
+    let (mut ctrl, _, _) = controller(dir.path(), true, git, false);
+
+    ctrl.handle(Intent::ToggleStatusMode);
+    ctrl.handle(Intent::NextChanged);
+    assert_eq!(
+        selected_name(&ctrl),
+        "status_only.rs",
+        "status mode walks the working-tree status set"
+    );
+}
+
+#[test]
+fn changed_jump_notices_an_empty_changed_set_and_is_inert_without_git() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+
+    // In a repo with nothing changed the key says so rather than doing nothing visible.
+    let (mut ctrl, _, _) = controller(dir.path(), true, StubGit::default(), false);
+    ctrl.handle(Intent::NextChanged);
+    assert!(
+        ctrl.action_notice().unwrap_or("").contains("No changed"),
+        "an empty changed-set is surfaced, got: {:?}",
+        ctrl.action_notice()
+    );
+
+    // Outside a repo there is no changed-set at all: inert (AC-26).
+    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
+    let fx = ctrl.handle(Intent::NextChanged);
+    assert!(!fx.redraw, "inert without git (AC-26)");
+    assert!(ctrl.action_notice().is_none());
+}
+
+#[test]
+fn changed_jump_expands_a_collapsed_directory_to_reach_the_file() {
+    // The deep-tree case the feature exists for: the changed file is several collapsed levels
+    // down, and `]` must still reach it from the unfiltered tree.
+    let dir = TempDir::new();
+    let deep = dir.path().join("src/main/java");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("Deep.java"), "x\n").unwrap();
+
+    let mut changed = BTreeMap::new();
+    changed.insert(PathBuf::from("src/main/java/Deep.java"), Status::Modified);
+    let git = StubGit {
+        changed,
+        ..Default::default()
+    };
+    let (mut ctrl, _, _) = controller(dir.path(), true, git, false);
+    assert_ne!(selected_name(&ctrl), "Deep.java", "precondition: collapsed");
+
+    ctrl.handle(Intent::NextChanged);
+    assert_eq!(
+        selected_name(&ctrl),
+        "Deep.java",
+        "] expands the collapsed ancestors and lands on the changed file"
+    );
 }

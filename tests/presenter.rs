@@ -6,7 +6,8 @@ use herdr_file_viewer::git::Status;
 use herdr_file_viewer::presenter::{
     AnnotationEditorKind, AnnotationEditorView, AnnotationIndicatorsView, AnnotationOverviewView,
     AnnotationRowView, AnnotationTargetView, CharSelView, ContentSearch, DiscardConfirmView,
-    FinderView, Focus, HelpView, LineSelectView, PickerRowView, PickerView, ViewState, draw,
+    FinderView, FlashLine, Focus, HelpView, LineSelectView, PickerRowView, PickerView, ViewState,
+    draw,
 };
 use herdr_file_viewer::render::to_text;
 use herdr_file_viewer::search::Match;
@@ -23,6 +24,7 @@ fn node(path: &str, kind: NodeKind, depth: usize, expanded: bool, status: Option
         expanded,
         status,
         dir_dirty: false,
+        label: None,
     }
 }
 
@@ -69,6 +71,7 @@ fn sample_state() -> ViewState {
             "Showing first 5000 lines (truncated)".to_string(), // AC-13
             "delta not found — showing plain diff".to_string(), // AC-25
         ],
+        flash: None,
         focus: Focus::Tree,
         width: 100,
         content_scroll: 0,
@@ -245,6 +248,7 @@ fn dirty_directory_carries_a_non_color_glyph_marker() {
             expanded: true,
             status: None,
             dir_dirty: true,
+            label: None,
         },
         Node {
             path: PathBuf::from("/r/clean"),
@@ -253,6 +257,7 @@ fn dirty_directory_carries_a_non_color_glyph_marker() {
             expanded: true,
             status: None,
             dir_dirty: false,
+            label: None,
         },
     ];
     state.selected = 1; // the clean dir, so the dirty dir row isn't REVERSED
@@ -290,6 +295,7 @@ fn dirty_directory_glyph_snapshot() {
             expanded: true,
             status: None,
             dir_dirty: true,
+            label: None,
         },
         node(
             "/r/changed/a.rs",
@@ -312,6 +318,7 @@ fn dirty_directory_glyph_snapshot() {
             expanded: false,
             status: None,
             dir_dirty: false,
+            label: None,
         },
         node(
             "/r/gone.txt",
@@ -367,6 +374,27 @@ fn surfaces_truncation_and_fallback_notices() {
     assert!(
         out.contains("delta not found"),
         "fallback notice (AC-25) visible\n{out}"
+    );
+}
+
+#[test]
+fn flash_line_renders_atop_the_notices_and_does_not_hide_them() {
+    // The self-expiring flash gets its own row above the persistent notices, so the flash text
+    // and both notices are all visible at once (the strip reserves a row for it).
+    let mut state = sample_state();
+    state.flash = Some(FlashLine {
+        text: "Diff: side-by-side".to_string(),
+        dim: false,
+    });
+    let out = render(&state, 100, 24);
+    assert!(
+        out.contains("Diff: side-by-side"),
+        "flash text visible\n{out}"
+    );
+    assert!(out.contains("truncated"), "notice still visible\n{out}");
+    assert!(
+        out.contains("delta not found"),
+        "notice still visible\n{out}"
     );
 }
 
@@ -1085,6 +1113,7 @@ fn tree_rows_are_colored_by_git_status() {
             expanded: true,
             status: None,
             dir_dirty: true,
+            label: None,
         },
         node(
             "/r/src/mod.rs",
@@ -3047,6 +3076,7 @@ fn line_select_state(marker: usize, start: usize, end: usize) -> ViewState {
         start,
         end,
         char_sel: None,
+        passive: false,
     });
     st
 }
@@ -3069,6 +3099,36 @@ fn selection_range_highlight_snapshot() {
         "presenter_line_select_range",
         render(&line_select_state(4, 2, 4), 100, 24)
     );
+}
+
+#[test]
+fn passive_range_highlight_has_no_caret_gutter() {
+    // Launch open-target range flash: whole-line HIGHLIGHT only — no ▶/│ column (not line-select mode).
+    use herdr_file_viewer::render::to_text;
+    let mut st = sample_state();
+    st.notices = vec![];
+    st.focus = Focus::Content;
+    st.content = to_text("line one\nline two\nline three\nline four\nline five\nline six\n");
+    st.content_rows = 6;
+    st.line_select = Some(LineSelectView {
+        marker: 2,
+        start: 2,
+        end: 4,
+        char_sel: None,
+        passive: true,
+    });
+    let out = render(&st, 100, 24);
+    // Active line-select injects the ▶ caret before source text; passive must not.
+    // (Selection bar │ collides with box-drawing borders, so caret is the reliable signal.)
+    assert!(
+        !out.contains('▶'),
+        "passive range flash must not draw ▶: {out}"
+    );
+    assert!(
+        out.contains("line two") && out.contains("line four"),
+        "{out}"
+    );
+    insta::assert_snapshot!("presenter_passive_range_flash", out);
 }
 
 #[test]
@@ -3684,14 +3744,17 @@ fn annotation_tree_markers_preserve_git_width_foregrounds_and_selection_style() 
     let area = Rect::new(0, 0, 100, 12);
     let annotated_width = geometry(area, &state).tree_content_width;
     let buf = render_buffer(&state, 100, 12);
+    // A file row reserves the expand arrow's two columns as blanks so its name lines up with a
+    // directory's at the same depth, so the markers sit that much further left of the name.
+    const GLYPH_W: u16 = 2;
     for (name, git, foreground) in [
         ("clean.rs", " ", Color::Reset),
         ("modified.rs", "M", Color::LightRed),
     ] {
         let (x, y) = find_cell(&buf, name);
-        assert_eq!(buf.cell((x - 2, y)).unwrap().symbol(), git);
-        assert_eq!(buf.cell((x - 1, y)).unwrap().symbol(), "@");
-        assert_eq!(buf.cell((x - 1, y)).unwrap().bg, Color::Reset);
+        assert_eq!(buf.cell((x - GLYPH_W - 2, y)).unwrap().symbol(), git);
+        assert_eq!(buf.cell((x - GLYPH_W - 1, y)).unwrap().symbol(), "@");
+        assert_eq!(buf.cell((x - GLYPH_W - 1, y)).unwrap().bg, Color::Reset);
         for offset in 0..name.len() as u16 {
             let cell = buf.cell((x + offset, y)).unwrap();
             assert_eq!(
@@ -3703,7 +3766,7 @@ fn annotation_tree_markers_preserve_git_width_foregrounds_and_selection_style() 
         }
     }
     let (x, y) = find_cell(&buf, "selected.rs");
-    assert_eq!(buf.cell((x - 1, y)).unwrap().symbol(), "@");
+    assert_eq!(buf.cell((x - GLYPH_W - 1, y)).unwrap().symbol(), "@");
     assert_eq!(buf.cell((x, y)).unwrap().bg, Color::Reset);
     assert!(
         buf.cell((x, y))
@@ -3913,6 +3976,7 @@ fn annotation_blank_lines_compose_exact_line_select_and_ambient_styles() {
         start: 1,
         end: 2,
         char_sel: None,
+        passive: false,
     });
     let area = Rect::new(0, 0, 30, 7);
     let text = geometry(area, &state).content_inner.unwrap();
@@ -3962,6 +4026,7 @@ fn annotation_nonblank_active_overlays_have_exact_precedence_and_preserve_wrappe
         start: 1,
         end: 2,
         char_sel: None,
+        passive: false,
     });
     let text = geometry(area, &state).content_inner.unwrap();
     let buf = render_buffer(&state, 30, 8);
@@ -4066,6 +4131,7 @@ fn annotation_active_overlay_branches_keep_line_select_and_ambient_ahead_of_sear
         start: 1,
         end: 2,
         char_sel: None,
+        passive: false,
     });
 
     let text = geometry(area, &state).content_inner.unwrap();
@@ -4469,4 +4535,40 @@ fn discard_confirm_names_the_pending_action_not_always_quit() {
         "a worktree switch must never offer to quit\n{out}"
     );
     insta::assert_snapshot!("presenter_discard_confirm_switch", out);
+}
+
+#[test]
+fn a_compacted_directory_row_renders_its_chain_label() {
+    // `compact_dirs` folds a run of single-child directories into one row whose Node carries a
+    // `label` (`src/main/java`); the tree must draw THAT, not the path's last component alone.
+    let mut state = sample_state();
+    state.notices = vec![];
+    state.selected = 1;
+    state.nodes = vec![
+        Node {
+            path: PathBuf::from("/r/src/main/java"),
+            kind: NodeKind::Dir,
+            depth: 0,
+            expanded: true,
+            status: None,
+            dir_dirty: false,
+            label: Some("src/main/java".to_string()),
+        },
+        node(
+            "/r/src/main/java/App.java",
+            NodeKind::File,
+            1,
+            false,
+            Some(Status::Modified),
+        ),
+    ];
+    let frame = render(&state, 100, 12);
+    assert!(
+        frame.contains("src/main/java"),
+        "the chain label is drawn in full\n{frame}"
+    );
+    assert!(
+        frame.contains("App.java"),
+        "its child still renders one level in\n{frame}"
+    );
 }
